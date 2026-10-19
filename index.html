@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZBOD Tool - Zero Based Organizational Design</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="stylesheet" href="style.css?v=80">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.0/dist/umd/supabase.min.js"
+          integrity="sha384-wgi7s9Y2xefdDru3II6Xb11y/YNoKVbuydTikWejwId9z2xRd8SveCTrJjj/QAnH"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+          integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
+          integrity="sha384-vtjasyidUo0kW94K5MXDXntzOJpQgBKXmE7e2Ga4LG0skTTLeBi97eFAXsqewJjw"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"
+          integrity="sha384-Pqp51FUN2/qzfxZxBCtF0stpc9ONI6MYZpVqmo8m20SoaQCzf+arZvACkLkirlPz"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"
+          integrity="sha384-PlRSzpewlarQuj5alIadXwjNUX+2eNMKwr0f07ShWYLy8B6TjEbm7ZlcN/ScSbwy"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"
+          integrity="sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="supabase.js?v=26"></script>
+</head>
+<body>
+  <!-- Background gradient shapes -->
+  <div class="bg-gradient-shapes">
+    <div class="bg-shape-1"></div>
+    <div class="bg-shape-2"></div>
+    <div class="bg-shape-3"></div>
+  </div>
+
+  <div class="zbod-toast-container" id="toast-container"></div>
+
+  <!-- Reusable Context Menu -->
+  <div id="context-menu" class="zbod-context-menu hidden"></div>
+
+  <!-- Reusable Confirm Dialog -->
+  <div id="confirm-dialog" class="hidden" style="position:fixed;inset:0;z-index:400;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+    <div class="zbod-card zbod-dialog" style="padding:24px;">
+      <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:8px;" id="confirm-dialog-title"></h3>
+      <p style="font-size:14px;color:#6b7280;margin-bottom:16px;white-space:pre-line;" id="confirm-dialog-body"></p>
+      <div class="flex gap-3" id="confirm-dialog-buttons"></div>
+    </div>
+  </div>
+
+  <!-- Reusable Function Editor Modal — Phase 1's org-chart-driven add/edit function form. Must
+       outrank the org chart's "Full Screen" overlay (.oc-fullscreen, z-index 250) so it still
+       shows when opened from a full-screen chart, and stay lower than #confirm-dialog (400) so
+       the "Remove this function?" confirm dialog, opened from inside this modal, always paints
+       on top of it. -->
+  <div id="fn-editor-modal" class="hidden" style="position:fixed;inset:0;z-index:390;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+    <div class="zbod-card" style="padding:28px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;">
+      <div id="fn-editor-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Reusable Field Help Popover — a single shared, top-level instance (portal) so it is
+       never clipped by a card's backdrop-filter/overflow; content is swapped in per field. -->
+  <div id="field-help-popover" class="zbod-help-popover hidden" role="tooltip">
+    <div class="zbod-help-popover__arrow"></div>
+    <div id="field-help-popover-body"></div>
+  </div>
+
+  <!-- Signed-in user menu — a single compact avatar button (Gmail/Slack/Notion pattern), not a
+       second header bar competing with each page's own nav. showPage() moves this single shared
+       node into whichever page's <nav class="sticky-header"> is currently active, as a genuine
+       flex participant (appended into that page's own right-side button group when one exists,
+       or directly into the nav row otherwise) -- not a viewport-fixed overlay independently
+       guessing the nav's position, and not an absolutely-positioned "right:32px" guess either
+       (that overlapped whatever page-specific content, e.g. Search + Add Structure, already sat
+       at that same offset). `margin-left:auto` pushes it to the far right of whichever flex row
+       it lands in either way, with normal flex gap/spacing from its neighbours -- collision with
+       sibling content isn't structurally possible, the browser's flex layout keeps it clear.
+       `position:relative` here is only a local anchor for the dropdown below. Closes on outside
+       click via the same global mousedown listener that already closes the context menu / help
+       popovers. Hidden on Sign In / Admin / Manage Users, which have their own logout control. -->
+  <div id="user-session-bar" class="hidden" style="position:relative;margin-left:auto;flex-shrink:0;z-index:150;">
+    <button id="user-session-avatar-btn" onclick="app.toggleUserMenu(event)" aria-label="Hesab menyusu" aria-haspopup="true" style="width:40px;height:40px;border-radius:50%;background:#2E642C;color:#fff;font-family:'Inter',sans-serif;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 0 0 1px #e4e7ec;">
+      <span id="user-session-initials"></span>
+    </button>
+    <div id="user-session-dropdown" class="hidden" style="position:absolute;top:48px;right:0;width:230px;background:#fff;border-radius:14px;box-shadow:0 12px 32px rgba(15,52,76,0.18);border:1px solid rgba(46,100,44,0.1);overflow:hidden;">
+      <div style="padding:14px 16px;border-bottom:1px solid rgba(46,100,44,0.08);">
+        <p id="user-session-name" style="font-size:13px;font-weight:700;color:#111827;margin-bottom:2px;"></p>
+        <p id="user-session-email" style="font-size:12px;color:#6b7280;"></p>
+      </div>
+      <button onclick="app.goToAccount()" style="display:block;width:100%;text-align:left;padding:11px 16px;font-size:13px;font-weight:500;color:#374151;">My Account</button>
+      <button onclick="app.signOut()" style="display:block;width:100%;text-align:left;padding:11px 16px;font-size:13px;font-weight:500;color:#991b1b;border-top:1px solid rgba(46,100,44,0.08);">Sign Out</button>
+    </div>
+  </div>
+
+  <!-- ===== SIGN IN PAGE ===== -->
+  <div id="page-signin" class="page hidden" style="position:relative;z-index:1;">
+    <div class="min-h-screen flex items-center justify-center" style="padding:16px;">
+      <div class="zbod-card p-8 max-w-md w-full" style="text-align:center;">
+        <img src="logo-icon.png" alt="Azerconnect Group" style="height:48px;width:auto;object-fit:contain;margin:0 auto 24px;">
+        <h1 style="font-family:'Montserrat',sans-serif;font-weight:800;font-size:24px;color:#111827;margin-bottom:8px;">ZBOD Tool</h1>
+        <p style="font-size:14px;color:#6b7280;margin-bottom:32px;">Zero-Based Organizational Design</p>
+        <div style="text-align:left;margin-bottom:16px;">
+          <label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Email</label>
+          <input type="email" class="zbod-input" id="signin-email-input" placeholder="you@company.com" onkeydown="if(event.key==='Enter')app.signIn()">
+        </div>
+        <div style="text-align:left;margin-bottom:4px;">
+          <label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Password</label>
+          <input type="password" class="zbod-input" id="signin-password-input" placeholder="Enter password" onkeydown="if(event.key==='Enter')app.signIn()">
+        </div>
+        <p id="signin-error" style="color:#991b1b;font-size:13px;min-height:18px;margin:8px 0 16px;text-align:left;"></p>
+        <button class="zbod-btn-primary w-full" style="justify-content:center;" onclick="app.signIn()">Sign In</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== ADMIN PANEL (placeholder) ===== -->
+  <div id="page-admin" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto">
+        <div class="flex items-center gap-3">
+          <img src="logo.png" alt="Azerconnect Group" style="height:40px;width:auto;object-fit:contain;">
+          <h1 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#1a1a2e;">Admin Panel</h1>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="admin-user-email" style="font-size:13px;color:#6b7280;"></span>
+          <button class="zbod-btn-secondary" onclick="app.goToManageUsers()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Manage Users
+          </button>
+          <!-- The Supabase free plan takes no backups, so a mistaken delete or a bad SQL statement
+               is unrecoverable. This downloads everything the admin can read as one JSON file. -->
+          <button class="zbod-btn-secondary" onclick="app.downloadBackup()" aria-label="Bütün məlumatın ehtiyat nüsxəsini yüklə" title="Bütün məlumatın ehtiyat nüsxəsini yüklə">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Backup
+          </button>
+          <button class="zbod-btn-secondary" onclick="app.signOut()">Çıxış</button>
+        </div>
+      </div>
+    </nav>
+    <div id="admin-landing-content"></div>
+  </div>
+
+  <!-- ===== MANAGE USERS PAGE (Admin only) ===== -->
+  <div id="page-manage-users" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto">
+        <div class="flex items-center gap-4">
+          <button class="zbod-btn-secondary" style="padding:10px 14px;" onclick="app.goToAdmin()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <h1 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#1a1a2e;">Manage Users</h1>
+        </div>
+        <button class="zbod-btn-primary" onclick="app.showAddUser()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add User
+        </button>
+      </div>
+    </nav>
+    <div class="p-8 max-w-6xl mx-auto" id="manage-users-content"></div>
+  </div>
+
+  <!-- User Form Dialog (Add/Edit — Admin only) -->
+  <div id="user-form-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+    <div class="zbod-card zbod-dialog" style="padding:24px;">
+      <h3 id="user-form-title" style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;">Add User</h3>
+      <div id="user-form-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+      <div class="space-y-3">
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Role *</label><select class="zbod-input" id="user-form-role"><option value="">Select role</option><option value="hrbp">HRBP</option><option value="cxo">CxO</option></select></div>
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Full Name *</label><input type="text" class="zbod-input" id="user-form-fullname" placeholder="Ad Soyad"></div>
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Position *</label><input type="text" class="zbod-input" id="user-form-position" placeholder="Vəzifə"></div>
+        <!-- A C-level can hold more than one area; each becomes its own Strategic Overview entry
+             with its own numbers, so they are entered here separated by commas. -->
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Area of Responsibility</label><input type="text" class="zbod-input" id="user-form-area" placeholder="e.g. Human Resources, Legal"><p style="font-size:11px;color:#6b7280;margin-top:4px;">Birdən çox sahə varsa vergüllə ayırın — hər biri Strategic Overview-də ayrıca seçim olacaq.</p></div>
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Email *</label><input type="email" class="zbod-input" id="user-form-email" placeholder="you@company.com"></div>
+        <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Password *</label>
+          <div style="position:relative;">
+            <input type="password" class="zbod-input" id="user-form-password" placeholder="Password" style="padding-right:40px;">
+            <button type="button" onclick="app.togglePasswordInput('user-form-password', this)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);padding:2px;color:#9ca3af;display:inline-flex;background:none;border:none;cursor:pointer;" title="Show/hide password">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="flex gap-3 mt-6">
+        <button class="zbod-btn-secondary flex-1" onclick="app.hideUserForm()">Cancel</button>
+        <button class="zbod-btn-primary flex-1" onclick="app.submitUserForm()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== MY ACCOUNT PAGE (User side) ===== -->
+  <div id="page-account" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto">
+        <div class="flex items-center gap-4">
+          <button class="zbod-btn-secondary" style="padding:10px 14px;" onclick="app.goToLanding()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <h1 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#1a1a2e;">My Account</h1>
+        </div>
+      </div>
+    </nav>
+    <div class="p-8 max-w-3xl mx-auto" id="account-content"></div>
+  </div>
+
+  <!-- ===== LANDING PAGE ===== -->
+  <div id="page-landing" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center px-8 py-4 max-w-7xl mx-auto">
+        <div class="flex items-center gap-3">
+          <img src="logo.png" alt="Azerconnect Group" style="height:40px;width:auto;object-fit:contain;">
+        </div>
+      </div>
+    </nav>
+    <div id="landing-content"></div>
+  </div>
+
+  <!-- ===== STRUCTURES PAGE ===== -->
+  <div id="page-divisions" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto">
+        <div class="flex items-center gap-4">
+          <button class="zbod-btn-secondary" style="padding:10px 14px;" onclick="app.backFromDivisions()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <h1 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#1a1a2e;">Organizational Structures</h1>
+        </div>
+        <div class="flex items-center gap-3">
+          <input type="text" id="division-search-input" class="zbod-input" placeholder="Search structures..." oninput="app.searchDivisions(this.value)" style="width:260px;padding:10px 14px;font-size:13px;">
+          <button id="add-structure-btn" class="zbod-btn-primary" onclick="app.showAddDivision()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Structure
+        </button>
+        </div>
+      </div>
+    </nav>
+    <div class="p-8 max-w-7xl mx-auto" id="divisions-content"></div>
+    <!-- Password Verification Dialog -->
+    <div id="password-verification-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;">Enter Structure Password</h3>
+        <div id="password-verification-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+        <div class="space-y-3">
+          <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Password</label><input type="password" class="zbod-input" id="structure-password-input" placeholder="Enter password"></div>
+        </div>
+        <div style="margin-top:12px;text-align:center;">
+          <button onclick="app.showResetPassword()" style="background:none;border:none;color:#0F3C76;font-size:12px;font-weight:600;cursor:pointer;text-decoration:underline;padding:0;font-family:'Inter',sans-serif;">Reset Password</button>
+        </div>
+        <div class="flex gap-3 mt-6">
+          <button class="zbod-btn-secondary flex-1" onclick="app.hidePasswordModal()">Cancel</button>
+          <button class="zbod-btn-primary flex-1" onclick="app.submitPassword()">Unlock</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Reset Code Dialog -->
+    <div id="reset-code-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;">Reset Workspace Password</h3>
+        <div id="reset-code-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+        <div class="space-y-3">
+          <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Reset Code</label><input type="password" class="zbod-input" id="reset-code-input" placeholder="Enter reset code"></div>
+        </div>
+        <div class="flex gap-3 mt-6">
+          <button class="zbod-btn-secondary flex-1" onclick="app.hideResetCodeModal()">Cancel</button>
+          <button class="zbod-btn-primary flex-1" onclick="app.submitResetCode()">Continue</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- New Password Dialog -->
+    <div id="new-password-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;">Set New Password</h3>
+        <div id="new-password-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+        <div class="space-y-3">
+          <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">New Password</label><input type="password" class="zbod-input" id="new-password-input" placeholder="Minimum 6 characters"></div>
+          <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Confirm New Password</label><input type="password" class="zbod-input" id="confirm-new-password-input" placeholder="Re-enter new password"></div>
+        </div>
+        <div class="flex gap-3 mt-6">
+          <button class="zbod-btn-secondary flex-1" onclick="app.hideNewPasswordModal()">Cancel</button>
+          <button class="zbod-btn-primary flex-1" onclick="app.saveNewPassword()">Save New Password</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Delete Password Verification Dialog -->
+    <div id="delete-password-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:8px;">Confirm Structure Deletion</h3>
+        <p style="font-size:14px;color:#6b7280;margin-bottom:16px;">Please enter the structure password to delete this item.</p>
+        <div id="delete-password-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+        <div class="space-y-3">
+          <div><label style="display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;">Password</label><input type="password" class="zbod-input" id="delete-password-input" placeholder="Enter password"></div>
+        </div>
+        <div class="flex gap-3 mt-6">
+          <button class="zbod-btn-secondary flex-1" onclick="app.hideDeletePasswordModal()">Cancel</button>
+          <button class="zbod-btn-primary flex-1" onclick="app.submitDeletePassword()">Delete</button>
+        </div>
+      </div>
+    </div>
+    <!-- Add Structure Dialog -->
+    <div id="division-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;">Add New Structure</h3>
+        <div id="division-form-errors" style="color:#991b1b;font-size:13px;margin-bottom:12px;"></div>
+        <div class="space-y-3" id="division-form-fields"></div>
+        <div class="flex gap-3 mt-6">
+          <button class="zbod-btn-secondary flex-1" onclick="app.hideAddDivision()">Cancel</button>
+          <button class="zbod-btn-primary flex-1" onclick="app.submitAddDivision()">Add Structure</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== WORKSPACE PAGE ===== -->
+  <div id="page-workspace" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto" id="workspace-header"></div>
+    </nav>
+    <div class="p-8 max-w-7xl mx-auto space-y-8" id="workspace-content"></div>
+    <!-- Workshop dialog -->
+    <div id="workshop-dialog" class="hidden" style="position:fixed;inset:0;z-index:100;background:rgba(16,24,40,0.45);display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div class="zbod-card zbod-dialog" style="padding:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#1a1a2e;margin-bottom:16px;" id="workshop-dialog-title">Start New Workshop</h3>
+        <p style="font-size:14px;color:#6b7280;margin-bottom:16px;" id="workshop-dialog-body"></p>
+        <div class="zbod-dialog-actions" id="workshop-dialog-buttons"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== WORKSHOP PHASE 1 ===== -->
+  <div id="page-phase1" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="phase1-header"></div>
+    </nav>
+    <div class="px-8 py-4" style="background:#fff;border-bottom:1px solid var(--border);">
+      <div class="max-w-3xl mx-auto">
+        <div class="zbod-phase-tracker justify-center">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+            <div class="zbod-phase-dot active">1</div>
+            <span style="font-size:11px;color:#2E642C;font-weight:600;white-space:nowrap;">Function ID &amp; Business Impact</span>
+          </div>
+          <div class="zbod-phase-line"></div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+            <div class="zbod-phase-dot pending">2</div>
+            <span style="font-size:11px;color:#9ca3af;font-weight:600;white-space:nowrap;">HC &amp; Cost</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="phase1-content"></div>
+  </div>
+
+  <!-- ===== WORKSHOP PHASE 3 ===== -->
+  <div id="page-phase3" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="phase3-header"></div>
+    </nav>
+    <div class="px-8 py-4" style="background:#fff;border-bottom:1px solid var(--border);">
+      <div class="max-w-3xl mx-auto">
+        <div class="zbod-phase-tracker justify-center">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+            <div class="zbod-phase-dot completed">1</div>
+            <span style="font-size:11px;color:#2E642C;font-weight:600;white-space:nowrap;">Function ID &amp; Business Impact</span>
+          </div>
+          <div class="zbod-phase-line active"></div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+            <div class="zbod-phase-dot active">2</div>
+            <span style="font-size:11px;color:#2E642C;font-weight:600;white-space:nowrap;">HC &amp; Cost</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="p-8 max-w-6xl mx-auto" id="phase3-content"></div>
+  </div>
+
+  <!-- ===== REVIEW PAGE ===== -->
+  <div id="page-review" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="review-header"></div>
+    </nav>
+    <div class="p-8 max-w-7xl mx-auto" id="review-content"></div>
+  </div>
+
+  <!-- ===== TRANSITION / EXECUTIVE DASHBOARD ===== -->
+  <div id="page-transition" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="transition-header"></div>
+    </nav>
+    <div class="p-8 max-w-screen-2xl mx-auto" id="transition-content"></div>
+  </div>
+
+  <!-- ===== HISTORY PAGE ===== -->
+  <div id="page-history" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="history-header"></div>
+    </nav>
+    <div class="p-8 max-w-5xl mx-auto" id="history-content"></div>
+  </div>
+
+  <!-- ===== HISTORY REVIEW PAGE ===== -->
+  <div id="page-history-review" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4" id="history-review-header"></div>
+    </nav>
+    <div class="p-8 max-w-screen-2xl mx-auto space-y-8" id="history-review-content"></div>
+  </div>
+
+  <!-- ===== HR REVIEW SUBMISSION PAGE ===== -->
+  <div id="page-hr-review" class="page hidden" style="position:relative;z-index:1;">
+    <nav class="sticky-header">
+      <div class="flex items-center justify-between px-8 py-4 max-w-7xl mx-auto" id="hr-review-header"></div>
+    </nav>
+    <div class="p-8 max-w-3xl mx-auto" id="hr-review-content"></div>
+  </div>
+
+  <!-- Export Report Modal -->
+  <div id="export-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:2000;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
+    <div id="export-modal" style="background:#ffffff;border-radius:20px;padding:32px;max-width:520px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,0.2);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+        <h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:20px;color:#111827;">Export Workshop Report</h3>
+        <button onclick="app.closeExportModal()" style="color:#9ca3af;padding:4px;font-size:20px;line-height:1;">&times;</button>
+      </div>
+      <p style="font-size:14px;color:#6b7280;margin-bottom:20px;">Select a workshop to export its report.</p>
+      <div id="export-modal-body" style="margin-bottom:24px;"></div>
+      <div id="export-modal-footer" style="display:flex;justify-content:flex-end;gap:12px;">
+        <button onclick="app.closeExportModal()" class="zbod-btn-secondary" style="padding:10px 20px;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js?v=233"></script>
+</body>
+</html>
