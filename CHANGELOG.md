@@ -2,6 +2,49 @@
 
 Notable implemented features, in the order the codebase evolved. Dates reflect the working session in which each change was made.
 
+## 2026-11-16 — Structure figures: current calculated, targets set on the structure page
+
+- Add New Structure asks only for Structure Name, Structure Type and C-Level Full Name. No figures are entered when a structure is created.
+- Structure page (Division Data): Current Total Headcount and Current Total Budget are calculated from the AS-IS functions (top level only), the same way Managers and Professionals are, and update with every AS-IS change and Excel upload. Values typed in the past are no longer used, but they are not deleted.
+- Headcount Target and Budget Target are typed straight into their cards and saved when the field is left. An empty field clears the target, and invalid values are refused. The Edit / Save / Cancel buttons are gone.
+- Removed because nothing is typed any more: the "entered vs from the functions" notice and the Save All comparison dialog.
+- The calculated totals are also used for the top-level AS-IS percentages, the dashboard AS-IS pies (no false "Remaining" slice at structure level) and Excel sheet 1.
+- A new workshop (Start / New, or Analyze AS-IS Baseline) does not start until both targets are set: "Set Headcount Target and Budget Target first."
+
+## 2026-11-16 — Excel import: warning for missing columns
+
+- When the AS-IS file has no recognisable Parent Function, Managers, Professionals, Managers Cost (AZN) or Professionals Cost (AZN) column, the import now names the missing columns. Previously this happened silently: without Parent Function every function was placed at the top level, and a missing number column set those figures to 0. The import itself is unchanged.
+
+## 2026-11-16 — Excel report: AS-IS Function Register sheet
+
+- The Excel report gains a 9th sheet, "9. AS-IS Function Register". Sheets 1–8 are unchanged.
+- The new sheet has the exact layout of the AS-IS upload template ("Function Register"): the same title, note, headers, colours and column widths, and a Parent Function list. It is filled with the structure's stored AS-IS functions. The ROOT row is the structure; each function is listed under its parent, and parents are shown in bold.
+- The sheet can be uploaded again through Autofill. Its name contains "Function Register", so the import picks it from the report and recreates the same functions, parents and figures.
+
+## 2026-11-16 — Unique function titles
+
+Titles are unique within one structure's AS-IS list and within one workshop. Letter case and extra spaces are ignored ("Payroll", " payroll ", "PAYROLL" count as one title). Nothing already stored is renamed; the checks only refuse a title.
+
+- AS-IS data: the title box on a card, a new row (Save and Save All), and Save in edit mode refuse a title that is already used in the structure. Save All keeps the refused rows open and saves the rest.
+- Excel import: a file that uses a title more than once is refused as a whole, nothing changes, and the message lists the titles.
+- "Analyze AS-IS Baseline" does not start while the AS-IS list uses a title more than once.
+- Phase 1 Add / Edit Function (both workshop types): a message under Function Name names the existing function as soon as a used title is typed, and Save is refused. Keeping a function's own title is allowed.
+- Complete Workshop (both workshop types) is refused while two functions share a title. Already completed workshops are left as they are.
+
+## 2026-11-16 — New workshop: Proposed Cost from Cost Allocation %
+
+Normal workshops only (created with Start / New). The AS-IS Baseline workshop and the AS-IS data are unchanged.
+
+- Phase 2 card: Proposed Cost is no longer typed. It is shown like Proposed HC and always equals Cost Allocation % of the pool (the Budget Target at the top level, the parent's Proposed Cost below it); changing the % updates it at once, and sub-functions follow their parent. The Cost % box shows two decimals.
+- Older workshops with typed Proposed Costs: when the workshop is opened, each typed cost becomes the exact Cost % it stands for (stored with as many decimals as needed). This is done only where every figure in the workshop stays exactly the same, to the qapik.
+- Moving a function to another parent, or deleting a parent in Phase 1: the moved function, and the sub-functions of a deleted one, keep their Proposed Cost exactly. Their Cost % is re-expressed against the new pool, and parents are not changed (same rule as before).
+- Review table: a normal workshop's Cost % is shown to two decimals.
+
+## 2026-11-12 — Root structure and Excel import
+
+- Excel import no longer reports the root as a missing parent. The root (the structure itself) is entered by hand, so a file may name it in Parent Function without a row of its own: the structure's name, a ROOT-marked row, or, in a file without a ROOT row, the unknown parent name most rows report into. Other unknown parent names (typos) are still reported.
+- Structure page: when the typed Current Total Headcount or Current Total Budget differs from the totals of the structure's functions, an amber notice at the top shows both figures. The typed figures are kept as entered.
+
 ## 2026-10-19 — Tablet layout
 
 - Portrait (768 px) and landscape (1024 px) tablets: page headers and card headers wrap instead of squeezing, dashboard pie charts sit one per row, and the decision summary sits above its chart below 1025 px. No page scrolls sideways.

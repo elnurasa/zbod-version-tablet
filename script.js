@@ -11,7 +11,6 @@ const state = {
   selectedDivisionId: null,
   selectedWorkshopId: null,
   selectedHistoryWorkshopId: null,
-  editingDivision: false,
   editingValues: {},
   phase3Values: {},
   p3ExpandedChildren: new Set(),
@@ -25,7 +24,6 @@ const state = {
   aaaCards: {},
   metricsDraft: {},
   toastId: 0,
-  _divEditForm: null,
   asIsSaved: false,
   metricsSaved: false,
   dashboardParentFilter: '',
@@ -890,7 +888,58 @@ function wfFinish(wsId, plan) {
 // parent would silently become a share of a different pool (5 of a 10-person unit turning into 100
 // of a 200 target). It keeps its own Proposed HC and Cost instead: its percentages are re-expressed
 // against the new pool. The parents keep their figures; their Children Allocation shows the change.
-function wfKeepFiguresUnder(ws, ids, parentOf) {
+// Normal workshop: Proposed Cost is always Cost Allocation % x its pool, never typed. To keep an
+// amount exactly (an older hand-typed cost, or a function moved under another parent) its Cost %
+// is stored with as many decimals as that takes; the card shows it rounded to two. Every candidate
+// is checked through the real cascade (sibling costs are split together, to the qapik), and only
+// one that reproduces the amounts exactly is used, so no figure moves.
+function wfCostPctCandidates(cost, pool) {
+  const out = [];
+  for (let d = 2; d <= 12; d++) {
+    const f = Math.pow(10, d);
+    const pct = Math.round((cost / pool) * 100 * f) / f;
+    if (!out.includes(pct)) out.push(pct);
+  }
+  const raw = (cost / pool) * 100;
+  if (!out.includes(raw)) out.push(raw);
+  return out;
+}
+function wfNormalCosts(div, fns) {
+  const c = buildCascadedAllocations(fns, div.headcount_target || 0, div.budget_target || 0, state.phase3Values || {}, false);
+  const out = {};
+  fns.forEach(f => { const v = (c[f.id] || {}).proposedBudget; out[f.id] = v === null || v === undefined ? null : roundMoney(v); });
+  return out;
+}
+// An older normal workshop may hold Proposed Costs typed by hand. When it is opened, each is turned
+// into the exact Cost % it stands for (parents first), but only where every figure in the workshop
+// stays exactly the same; anything else is left as it was.
+function wfCostsToPercents(wsId) {
+  const ws = getWs().find(w => w.id === wsId);
+  if (!ws || ws.source === 'as_is_baseline' || ws.status === 'completed') return;
+  const div = getDivs().find(d => d.id === ws.division_id);
+  if (!div) return;
+  let fns = getFns().filter(f => f.workshop_id === wsId);
+  if (!fns.some(f => f.proposed_budget_manual)) return;
+  const byId = Object.fromEntries(fns.map(f => [f.id, f]));
+  const depth = f => { let d = 0, cur = f, seen = new Set(); while (cur && cur.parent_id && byId[cur.parent_id] && !seen.has(cur.id)) { seen.add(cur.id); cur = byId[cur.parent_id]; d++; } return d; };
+  const before = wfNormalCosts(div, fns);
+  fns.filter(f => f.proposed_budget_manual).sort((a, b) => depth(a) - depth(b)).forEach(f => {
+    const cost = before[f.id];
+    const pool = f.parent_id && byId[f.parent_id] ? before[f.parent_id] : (div.budget_target || 0);
+    if (cost === null || !(pool > 0)) return;
+    for (const pct of wfCostPctCandidates(cost, pool)) {
+      const trial = fns.map(x => (x.id === f.id ? { ...x, cost_allocation_percent: pct, proposed_budget_manual: false } : x));
+      const after = wfNormalCosts(div, trial);
+      if (fns.every(x => after[x.id] === before[x.id])) {
+        fns = trial;
+        updFn(f.id, { cost_allocation_percent: pct, proposed_budget_manual: false });
+        return;
+      }
+    }
+  });
+}
+
+function wfKeepFiguresUnder(ws, ids, parentOf, removedId) {
   const div = getDivs().find(d => d.id === ws.division_id);
   if (!div) return;
   const before = Object.fromEntries(freshWorkshopFns(ws).map(f => [f.id, f]));
@@ -916,6 +965,30 @@ function wfKeepFiguresUnder(ws, ids, parentOf) {
       delete state.phase3Values[id].hc_allocation_percent; delete state.phase3Values[id].proposed_budget; delete state.phase3Values[id].cost_allocation_percent;
     }
     if (Object.keys(fields).length) updFn(id, fields);
+  });
+  // The cost is kept through an exact Cost % rather than as a typed figure (Proposed Cost is not
+  // typed in a normal workshop). Checked against the workshop as it will be after the move; if no
+  // percentage reproduces the amount exactly, it stays held as before, so it never moves.
+  let fns = getFns().filter(f => f.workshop_id === ws.id && f.id !== removedId).map(f => (ids.includes(f.id) ? { ...f, parent_id: parentOf(f.id) || '' } : f));
+  // Every kept function is checked on each step: siblings share the rounding, so turning one into a
+  // percentage must not move another by a qapik.
+  const keep = {};
+  ids.forEach(id => { const f = before[id]; if (f && f.proposed_budget !== null && f.proposed_budget !== undefined) keep[id] = roundMoney(f.proposed_budget); });
+  ids.forEach(id => {
+    if (keep[id] === undefined) return;
+    const cost = keep[id];
+    const pid = parentOf(id);
+    const pool = pid ? wfNormalCosts(div, fns)[pid] : (div.budget_target || 0);
+    if (!(pool > 0)) return;
+    for (const pct of wfCostPctCandidates(cost, pool)) {
+      const trial = fns.map(x => (x.id === id ? { ...x, cost_allocation_percent: pct, proposed_budget_manual: false } : x));
+      const after = wfNormalCosts(div, trial);
+      if (Object.keys(keep).every(k => after[k] === keep[k])) {
+        fns = trial;
+        updFn(id, { cost_allocation_percent: pct, proposed_budget_manual: false });
+        return;
+      }
+    }
   });
 }
 
@@ -944,7 +1017,7 @@ function workshopDeleteFunction(wsId, fnId) {
   const orphans = getFns().filter(f => f.workshop_id === wsId && f.parent_id === fnId).map(f => f.id);
   if (!wfIsBaseline(wsId)) {
     const ws = getWs().find(w => w.id === wsId);
-    if (ws) wfKeepFiguresUnder(ws, orphans, () => null);   // they become top-level, keeping their numbers
+    if (ws) wfKeepFiguresUnder(ws, orphans, () => null, fnId);   // they become top-level, keeping their numbers
     orphans.forEach(id => updFn(id, { parent_id: '' }));
     delFn(fnId);
     recomputeAndSaveAllCascaded(wsId, state.phase3Values || {});
@@ -993,6 +1066,43 @@ function workshopEditFigure(wsId, fnId, field, rawValue) {
 
 // The AS-IS side of an AS-IS Baseline workshop's dashboard and charts is the original AS-IS data,
 // whatever was moved or removed in the workshop since (the workshop's own "As-Is" copy is frozen).
+// Function titles are unique within one structure's AS-IS list and within one workshop. Letter case
+// and extra spaces are ignored ("Payroll", " payroll ", "PAYROLL" are one title). Titles identify
+// functions on screen and in the dashboard's parent filter, so two of the same cannot be told apart.
+// These checks only refuse a title; nothing already stored is ever renamed.
+function normFnTitle(t) { return String(t == null ? '' : t).trim().replace(/\s+/g, ' ').toLowerCase(); }
+function findTitleClash(list, title, nameKey, exceptId) {
+  const k = normFnTitle(title);
+  if (!k) return null;
+  return list.find(f => f.id !== exceptId && normFnTitle(f[nameKey]) === k) || null;
+}
+function duplicateTitles(list, nameKey) {
+  const seen = {}, first = {}, out = [];
+  list.forEach(f => {
+    const k = normFnTitle(f[nameKey]);
+    if (!k) return;
+    if (!seen[k]) first[k] = String(f[nameKey]).trim();
+    seen[k] = (seen[k] || 0) + 1;
+    if (seen[k] === 2) out.push(first[k]);
+  });
+  return out;
+}
+function titleTakenMessage(title, where) { return `A function named "${String(title).trim()}" already exists in this ${where}.`; }
+
+// A structure's current headcount and budget are not typed: they are the totals of its AS-IS
+// functions (top level only — a sub-function's figures sit inside its parent's), so they follow every
+// change to the AS-IS list and every Excel upload. Only the two targets are entered by hand.
+function asIsCurrentTotals(fns) {
+  const ids = new Set(fns.map(f => f.id));
+  const top = fns.filter(f => !(f.parent_id && ids.has(f.parent_id)));
+  return {
+    hc: top.reduce((s, f) => s + (f.manager_count || 0) + (f.current_employee_count || 0), 0),
+    budget: roundMoney(top.reduce((s, f) => s + (f.managers_cost || 0) + (f.professionals_cost || 0), 0)),
+  };
+}
+// A workshop splits the targets, so it cannot start before both are set.
+function divTargetsSet(div) { return !!div && Number(div.headcount_target) > 0 && Number(div.budget_target) > 0; }
+
 function getWorkshopAsIs(ws) {
   return getAsIs().filter(f => f.division_id === ws.division_id);
 }
@@ -1042,6 +1152,11 @@ function importAsIsFunctionsFromWorkbook(divisionId, arrayBuffer) {
     toast('Could not find a "Function Title" column in this file', { type: 'error' });
     return;
   }
+  // A column the import cannot find used to pass silently: without Parent Function every function
+  // landed at the top level, and a missing number column left those figures at 0. Both are now
+  // reported once the rows are in (see applyAsIsImportRows).
+  const missingCols = [['parent', 'Parent Function'], ['mgr', 'Managers'], ['prof', 'Professionals'], ['mgrCost', 'Managers Cost (AZN)'], ['profCost', 'Professionals Cost (AZN)']]
+    .filter(([k]) => cols[k] === undefined).map(([, label]) => label);
 
   // Every number is checked: text, negatives, part-people and sub-qapik amounts are corrected and
   // reported instead of being stored silently.
@@ -1057,6 +1172,7 @@ function importAsIsFunctionsFromWorkbook(divisionId, arrayBuffer) {
     return whole ? n : roundMoney(n);
   };
   const parsedRows = [];
+  const rootNames = [];
   for (let r = headerRowIdx + 1; r < rows.length; r++) {
     const row = rows[r] || [];
     const name = String(row[cols.name] == null ? '' : row[cols.name]).trim();
@@ -1068,7 +1184,7 @@ function importAsIsFunctionsFromWorkbook(divisionId, arrayBuffer) {
     // to report into -- it isn't a function with its own headcount/cost, and isn't created here.
     // Any row whose Parent Function names it simply won't match a sibling below and falls back
     // to "no parent" (reports directly to the division), which is exactly the intended result.
-    if (cols.marker !== undefined && String(row[cols.marker] == null ? '' : row[cols.marker]).trim().toLowerCase() === 'root') continue;
+    if (cols.marker !== undefined && String(row[cols.marker] == null ? '' : row[cols.marker]).trim().toLowerCase() === 'root') { rootNames.push(name.toLowerCase()); continue; }
     parsedRows.push({
       name,
       parent: cols.parent !== undefined ? String(row[cols.parent] == null ? '' : row[cols.parent]).trim() : '',
@@ -1082,12 +1198,19 @@ function importAsIsFunctionsFromWorkbook(divisionId, arrayBuffer) {
     toast('No function rows found under the header in this file', { type: 'error' });
     return;
   }
+  const dupTitles = duplicateTitles(parsedRows, 'name');
+  if (dupTitles.length) {
+    toast('File not imported', { type: 'error', description: `These function titles appear more than once in the file: ${dupTitles.join(', ')}. Rename them and upload the file again.` });
+    return;
+  }
 
   // The register is this division's AS-IS structure, not an addition to it. Importing used to
   // append unconditionally, so running the autofill twice left two full copies — each row with a
   // fresh id, so both copies also reached the cloud and came back on the next load. Parked here
   // for confirmation rather than replacing silently, since the existing rows may be hand-edited.
   parsedRows.notes = notes;
+  parsedRows.rootNames = rootNames;
+  parsedRows.missingCols = missingCols;
   const existing = getAsIs().filter(f => f.division_id === divisionId);
   if (existing.length > 0) {
     state._pendingAsIsImport = { divisionId, parsedRows };
@@ -1147,12 +1270,26 @@ function applyAsIsImportRows(divisionId, parsedRows) {
     return false;
   };
   const divName = ((getDivs().find(d => d.id === divisionId) || {}).structure_name || '').toLowerCase();
+  // The root (the structure itself) is entered by hand, not imported, so its name is a valid
+  // parent that has no row of its own: the structure's name, a ROOT-marked row's name, or, in a
+  // file without a ROOT row, the unknown parent name most rows report into. Only other unknown
+  // parent names (typos) are reported.
+  const rootNames = new Set([divName, ...(parsedRows.rootNames || [])].filter(Boolean));
+  if (!(parsedRows.rootNames || []).length) {
+    const unknown = {};
+    parsedRows.forEach(r => {
+      const k = (r.parent || '').toLowerCase();
+      if (k && !nameToId[k] && !rootNames.has(k)) unknown[k] = (unknown[k] || 0) + 1;
+    });
+    const top = Object.keys(unknown).sort((a, b) => unknown[b] - unknown[a])[0];
+    if (top) rootNames.add(top);
+  }
   parsedRows.forEach(r => {
     if (!r.parent) return;
     const selfId = r._id;
     const parentId = nameToId[r.parent.toLowerCase()];
     if (!parentId) {
-      if (r.parent.toLowerCase() !== divName) notes.push(`${r.name}: parent "${r.parent}" was not found in the file, placed at the top level`);
+      if (!rootNames.has(r.parent.toLowerCase())) notes.push(`${r.name}: parent "${r.parent}" was not found in the file, placed at the top level`);
       return;
     }
     if (parentId === selfId) { notes.push(`${r.name}: a function cannot be its own parent, placed at the top level`); return; }
@@ -1169,6 +1306,14 @@ function applyAsIsImportRows(divisionId, parsedRows) {
       description: notes.slice(0, 5).join('. ') + (notes.length > 5 ? `. And ${notes.length - 5} more.` : '.'),
     });
     console.warn('[import] corrections:', notes);
+  }
+  const missingCols = parsedRows.missingCols || [];
+  if (missingCols.length) {
+    const parts = [`These columns were not found in the file: ${missingCols.join(', ')}.`];
+    if (missingCols.includes('Parent Function')) parts.push('All functions were placed at the top level.');
+    if (missingCols.some(c => c !== 'Parent Function')) parts.push('The figures in the missing columns were set to 0.');
+    parts.push('Check the column headers against the template and upload the file again.');
+    toast('Check the imported file', { type: 'error', description: parts.join(' ') });
   }
 }
 
@@ -3382,10 +3527,6 @@ function getDivisionFormFields() {
     { key: 'structure_name', label: 'Structure Name *', placeholder: 'Select structure name', type: 'select', options: STRUCTURE_NAMES, other: true },
     { key: 'structure_type', label: 'Structure Type *', placeholder: 'Select structure type', type: 'select', options: STRUCTURE_TYPES, other: true },
     { key: 'c_level_name', label: 'C-Level Full Name *', placeholder: '', type: 'text' },
-    { key: 'current_total_hc', label: 'Current Total Headcount *', placeholder: '', type: 'number' },
-    { key: 'headcount_target', label: 'Headcount Target *', placeholder: '', type: 'number' },
-    { key: 'current_total_budget', label: 'Current Total Budget (AZN) *', placeholder: '', type: 'money' },
-    { key: 'budget_target', label: 'Budget Target (AZN) *', placeholder: '', type: 'money' },
   ];
 }
 
@@ -3501,26 +3642,31 @@ async function renderWorkspace() {
       <button class="zbod-btn-secondary" onclick="app.goToHistory()">${ICONS.history} Previous Workshops</button>
     </div>`;
 
-  let divDataHtml = '';
-  if (state.editingDivision) {
-    const ef = state._divEditForm || {};
-    const editLabels = { current_total_hc: 'Current Total Headcount', headcount_target: 'Headcount Target', current_total_budget: 'Current Total Budget (AZN)', budget_target: 'Budget Target (AZN)' };
-    const editFields = ['current_total_hc','headcount_target','current_total_budget','budget_target'];
-    divDataHtml = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-      ${editFields.map(k => { const cur = ef[k] !== undefined ? ef[k] : (div[k] || 0); const isMoney = k.endsWith('budget') || k === 'budget_target'; return `<div><label style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;display:block;">${editLabels[k]}</label>${isMoney ? `<input ${moneyInputAttrs()} class="zbod-input" id="wdiv-${k}" value="${formatMoneyValue(cur)}">` : `<input type="number" class="zbod-input" id="wdiv-${k}" value="${cur}" onwheel="return false;">`}</div>`; }).join('')}</div>`;
-  } else {
-    const asIsMgrs = rootAsIsFns.reduce((s, f) => s + (f.manager_count || 0), 0);
-    const asIsProfs = rootAsIsFns.reduce((s, f) => s + (f.current_employee_count || 0), 0);
-    const card = (icon, label, value, color) => `<div style="padding:16px;border-radius:12px;background:${color === 'blue' ? 'rgba(15,60,118,0.04)' : 'rgba(46,100,44,0.04)'};border:1px solid ${color === 'blue' ? 'rgba(15,60,118,0.1)' : 'rgba(46,100,44,0.1)'}"><div class="flex items-center gap-2 mb-1">${icon}<span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">${label}</span></div><p style="font-size:20px;font-weight:700;color:${color === 'blue' ? '#0F3C76' : '#111827'};">${formatNumber(value)}</p></div>`;
-    divDataHtml = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-      ${card(ICONS.users, 'Current Total Headcount', div.current_total_hc || 0, 'green')}
-      ${card(ICONS.target, 'Headcount Target', div.headcount_target || 0, 'blue')}
+  // Current Total Headcount / Budget are the AS-IS totals (asIsCurrentTotals); the two targets are
+  // typed straight into their cards and saved as soon as the field is left.
+  const curTotals = asIsCurrentTotals(asIsFns);
+  const asIsMgrs = rootAsIsFns.reduce((s, f) => s + (f.manager_count || 0), 0);
+  const asIsProfs = rootAsIsFns.reduce((s, f) => s + (f.current_employee_count || 0), 0);
+  const cardShell = (icon, label, color, inner) => `<div style="padding:16px;border-radius:12px;background:${color === 'blue' ? 'rgba(15,60,118,0.04)' : 'rgba(46,100,44,0.04)'};border:1px solid ${color === 'blue' ? 'rgba(15,60,118,0.1)' : 'rgba(46,100,44,0.1)'}"><div class="flex items-center gap-2 mb-1">${icon}<span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">${label}</span></div>${inner}</div>`;
+  const card = (icon, label, value, color) => cardShell(icon, label, color, `<p style="font-size:20px;font-weight:700;color:${color === 'blue' ? '#0F3C76' : '#111827'};">${formatNumber(value)}</p>`);
+  const targetCard = (icon, label, key, isMoney) => {
+    const v = div[key];
+    const has = v !== null && v !== undefined && v !== '';
+    if (readOnly) return card(icon, label, has ? v : 0, 'blue');
+    const look = 'class="zbod-input w-full" style="font-size:18px;font-weight:700;color:#0F3C76;padding:6px 10px;margin-top:2px;" placeholder="Set target" aria-label="' + label + '"';
+    const input = isMoney
+      ? `<input ${moneyInputAttrs()} id="wdiv-${key}" ${look} value="${has ? formatMoneyValue(v) : ''}" onchange="app.saveDivisionTarget('${key}', this.value)">`
+      : `<input type="number" min="0" step="1" id="wdiv-${key}" ${look} value="${has ? v : ''}" onchange="app.saveDivisionTarget('${key}', this.value)" onwheel="return false;">`;
+    return cardShell(icon, label, 'blue', input);
+  };
+  const divDataHtml = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      ${card(ICONS.users, 'Current Total Headcount', curTotals.hc, 'green')}
+      ${targetCard(ICONS.target, 'Headcount Target', 'headcount_target', false)}
       ${card(ICONS.userCog, 'Managers', asIsMgrs, 'green')}
-      ${card(ICONS.dollar, 'Current Total Budget (AZN)', div.current_total_budget || 0, 'green')}
-      ${card(ICONS.dollar, 'Budget Target (AZN)', div.budget_target || 0, 'blue')}
+      ${card(ICONS.dollar, 'Current Total Budget (AZN)', curTotals.budget, 'green')}
+      ${targetCard(ICONS.dollar, 'Budget Target (AZN)', 'budget_target', true)}
       ${card(ICONS.users, 'Professionals', asIsProfs, 'green')}
     </div>`;
-  }
 
   let asIsHtml = '';
   const totalAsIsHC = rootAsIsFns.reduce((s, f) => s + (f.current_function_hc || 0), 0);
@@ -3549,9 +3695,9 @@ async function renderWorkspace() {
 
   // Given a parentId, return the HC and Budget denominator for allocation %
   const asIsParentBase = (parentId) => {
-    if (!parentId) return { hc: div.current_total_hc || 0, budget: div.current_total_budget || 0, label: div.structure_name || 'Division' };
+    if (!parentId) return { hc: curTotals.hc, budget: curTotals.budget, label: div.structure_name || 'Division' };
     const p = asIsFns.find(f => f.id === parentId);
-    if (!p) return { hc: div.current_total_hc || 0, budget: div.current_total_budget || 0, label: div.structure_name || 'Division' };
+    if (!p) return { hc: curTotals.hc, budget: curTotals.budget, label: div.structure_name || 'Division' };
     return { hc: p.current_function_hc || 0, budget: (p.managers_cost || 0) + (p.professionals_cost || 0), label: p.function_name || 'Parent' };
   };
 
@@ -3921,9 +4067,6 @@ async function renderWorkspace() {
     <div class="zbod-card p-6">
       <div class="flex items-center justify-between mb-4">
         <div class="flex items-center gap-3"><div style="width:32px;height:32px;border-radius:8px;background:rgba(46,100,44,0.1);display:flex;align-items:center;justify-content:center;">${ICONS.target}</div><h3 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#111827;">${dataBoxTitle}</h3></div>
-        ${readOnly ? '' : (state.editingDivision
-          ? `<div class="flex items-center gap-2"><button onclick="app.saveDivisionData()" class="zbod-btn-primary" style="padding:8px 16px;font-size:13px;">${ICONS.save} Save</button><button onclick="app.cancelDivisionEdit()" class="zbod-btn-secondary" style="padding:8px 16px;font-size:13px;">${ICONS.x} Cancel</button></div>`
-          : `<button onclick="app.editDivisionData()" class="zbod-btn-secondary" style="padding:8px 16px;font-size:13px;">${ICONS.edit} Edit</button>`)}
       </div>
       ${divDataHtml}
     </div>
@@ -4371,7 +4514,7 @@ function renderFunctionModal() {
     </div>
     <div class="space-y-4">
       <div><label style="${label}">Parent *</label>${parentField}</div>
-      <div><label style="${label}">Function Name *</label><div class="zbod-field-help-wrap"><input class="zbod-input zbod-input--with-help w-full" value="${escHtml(d.proposed_function_name)}" onchange="app.updateFnModalDraft('proposed_function_name', this.value)" placeholder="" style="font-weight:600;">${renderFieldHelp('fn-modal-name', FUNCTION_NAME_HELP_QA)}</div></div>
+      <div><label style="${label}">Function Name *</label><div class="zbod-field-help-wrap"><input class="zbod-input zbod-input--with-help w-full" value="${escHtml(d.proposed_function_name)}" oninput="app.checkFnModalTitle(this.value)" onchange="app.updateFnModalDraft('proposed_function_name', this.value)" placeholder="" style="font-weight:600;">${renderFieldHelp('fn-modal-name', FUNCTION_NAME_HELP_QA)}</div>${(() => { const clash = findTitleClash(fns, d.proposed_function_name, 'proposed_function_name', isEdit ? m.fnId : null); return `<p id="fn-modal-name-error" style="font-size:12px;font-weight:600;color:#B42318;margin-top:6px;"${clash ? '' : ' hidden'}>${clash ? escHtml(titleTakenMessage(clash.proposed_function_name, 'workshop')) : ''}</p>`; })()}</div>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div><div class="flex items-center gap-2" style="margin-bottom:6px;"><label style="${label}margin:0;">Management Layer *</label>${renderFieldHelp('fn-modal-layer', LAYER_GUIDE_QA)}</div><select class="zbod-select w-full" onchange="app.updateFnModalDraft('career_level', this.value)"><option value="">Select layer</option><option value="Senior Management" ${d.career_level==='Senior Management'?'selected':''}>Senior Management</option><option value="Middle Management" ${d.career_level==='Middle Management'?'selected':''}>Middle Management</option><option value="Lower Management" ${d.career_level==='Lower Management'?'selected':''}>Lower Management</option></select></div>
         <div><label style="${label}">Structure Type *</label><select class="zbod-select w-full" onchange="app.updateFnModalDraft('function_structure_type', this.value)"><option value="">Select type</option><option value="Division" ${d.function_structure_type==='Division'?'selected':''}>Division</option><option value="Department" ${d.function_structure_type==='Department'?'selected':''}>Department</option><option value="Unit" ${d.function_structure_type==='Unit'?'selected':''}>Unit</option><option value="Other" ${d.function_structure_type==='Other'?'selected':''}>Other</option></select></div>
@@ -4582,8 +4725,8 @@ function renderPhase3() {
         </div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
           <div><label style="${P3_LBL}">Total Target Cost</label><input type="text" class="zbod-input w-full" style="background:#f3f4f6;" value="${formatMoneyValue(workplaceBudget)}" readonly tabindex="-1"></div>
-          <div><label style="${P3_LBL}">Cost Allocation %</label><input type="number" class="zbod-input w-full" value="${costAlloc !== null && costAlloc !== undefined ? costAlloc : ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','cost_allocation_percent',this.value)" placeholder="%" onwheel="return false;"></div>
-          <div><label style="${P3_LBL}">Proposed Cost</label><input ${moneyInputAttrs()} class="zbod-input w-full" style="font-weight:700;" value="${proposedBudget !== null ? formatMoneyValue(proposedBudget) : ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','proposed_budget',this.value)" placeholder="${costAlloc ? 'Cost Allocation %' : '0'}"></div>
+          <div><label style="${P3_LBL}">Cost Allocation %</label><input type="number" class="zbod-input w-full" value="${costAlloc !== null && costAlloc !== undefined && costAlloc !== '' ? Math.round(Number(costAlloc) * 100) / 100 : ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','cost_allocation_percent',this.value)" placeholder="%" onwheel="return false;"></div>
+          <div style="display:flex;flex-direction:column;justify-content:center;"><label style="${P3_LBL}">Proposed Cost</label><span style="font-size:20px;font-weight:800;color:#111827;">${proposedBudget !== null && proposedBudget !== undefined ? formatMoneyValue(proposedBudget) : '-'}</span></div>
         </div>`}
         <div class="flex items-center gap-2" style="margin-top:16px;"><span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;">People Allocation</span>${renderFieldHelp('p3-people-allocation-' + f.id, PEOPLE_ALLOCATION_HELP_QA)}</div>
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mt-4">
@@ -4915,7 +5058,7 @@ function renderReview() {
           } else {
             reviewBadge = `<span style="padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;background:rgba(156,163,175,0.1);color:#6b7280;">-</span>`;
           }
-          return `<tr><td style="font-weight:700;color:#16A34A;">${f.function_number}</td><td style="font-weight:500;">${escHtml(f.proposed_function_name)}</td><td>${escHtml(f.career_level)}</td><td style="font-size:12px;min-width:170px;">${escHtml(impactAnswer('question1_score', f.question1_score)) || '-'}</td><td style="font-size:12px;min-width:170px;">${escHtml(impactAnswer('question2_score', f.question2_score)) || '-'}</td><td>${decisionBadge(dec, 'sm')}</td><td>${reviewBadge}</td><td>${f.hc_allocation_percent || '-'}${f.hc_allocation_percent ? '%' : ''}</td><td>${formatNumber(f.proposed_hc || 0)}</td><td>${f.cost_allocation_percent || '-'}${f.cost_allocation_percent ? '%' : ''}</td><td>${formatNumber(f.proposed_budget || 0)}</td></tr>`;
+          return `<tr><td style="font-weight:700;color:#16A34A;">${f.function_number}</td><td style="font-weight:500;">${escHtml(f.proposed_function_name)}</td><td>${escHtml(f.career_level)}</td><td style="font-size:12px;min-width:170px;">${escHtml(impactAnswer('question1_score', f.question1_score)) || '-'}</td><td style="font-size:12px;min-width:170px;">${escHtml(impactAnswer('question2_score', f.question2_score)) || '-'}</td><td>${decisionBadge(dec, 'sm')}</td><td>${reviewBadge}</td><td>${f.hc_allocation_percent || '-'}${f.hc_allocation_percent ? '%' : ''}</td><td>${formatNumber(f.proposed_hc || 0)}</td><td>${(ws.source === 'as_is_baseline' || !f.cost_allocation_percent ? f.cost_allocation_percent : Math.round(Number(f.cost_allocation_percent) * 100) / 100) || '-'}${f.cost_allocation_percent ? '%' : ''}</td><td>${formatNumber(f.proposed_budget || 0)}</td></tr>`;
         }).join('')}
       </tbody>
     </table></div>
@@ -5376,8 +5519,9 @@ function renderDashboardCharts(inc, kp, opt, elm, fns, asIsFns, div, chartPrefix
     buildDistribution(fns, f => f.proposed_hc, f => f.proposed_function_name, 'proposed_function_name', div.headcount_target || 0));
   makeDistChart(chartPrefix + 'budgetPieChart',
     buildDistribution(fns, f => f.proposed_budget, f => f.proposed_function_name, 'proposed_function_name', div.budget_target || 0));
-  makeDistChart(chartPrefix + 'asIsHcPieChart', buildDistribution(asIsFns, f => f.current_function_hc, f => f.function_name, 'function_name', div.current_total_hc || 0));
-  makeDistChart(chartPrefix + 'asIsBudgetPieChart', buildDistribution(asIsFns, f => (f.managers_cost || 0) + (f.professionals_cost || 0), f => f.function_name, 'function_name', div.current_total_budget || 0));
+  const asIsCur = asIsCurrentTotals(asIsFns);
+  makeDistChart(chartPrefix + 'asIsHcPieChart', buildDistribution(asIsFns, f => f.current_function_hc, f => f.function_name, 'function_name', asIsCur.hc));
+  makeDistChart(chartPrefix + 'asIsBudgetPieChart', buildDistribution(asIsFns, f => (f.managers_cost || 0) + (f.professionals_cost || 0), f => f.function_name, 'function_name', asIsCur.budget));
 }
 
 // Builds a genuine parent-child tree diagram for the AS-IS function hierarchy. Reuses the same
@@ -5991,7 +6135,7 @@ const app = {
   selectDivision(id) {
     const div = getDivs().find(d => d.id === id);
     if (!div || !canAccessDivision(div)) { toast('You do not have access to this structure', { type: 'error' }); return; }
-    state.selectedDivisionId = id; state.editingDivision = false; state._divEditForm = null;
+    state.selectedDivisionId = id;
     state.asIsNewRows = []; state.asIsEditing = {}; state.asIsSaved = false; state.metricsSaved = false;
     state.aaaEditCardIdx = null;
     showPage('workspace'); renderWorkspace();
@@ -6812,37 +6956,18 @@ const app = {
     toast('Structure deleted');
   },
 
-  editDivisionData() {
+  // A target typed into its card on the structure page. An empty box clears it (not set yet).
+  saveDivisionTarget(key, value) {
     if (isReadOnlyViewer()) { toast('View only', { type: 'error' }); return; }
-    const div = getDivs().find(d => d.id === state.selectedDivisionId);
-    if (!div) return;
-    state.editingDivision = true;
-    state._divEditForm = { current_total_hc: div.current_total_hc, current_total_budget: div.current_total_budget, headcount_target: div.headcount_target, budget_target: div.budget_target };
-    renderWorkspace();
-  },
-
-  saveDivisionData() {
-    if (isReadOnlyViewer()) { toast('View only', { type: 'error' }); return; }
-    const updates = {};
-    const errors = [];
-    const labels = { current_total_hc: 'Current Total Headcount', headcount_target: 'Headcount Target', current_total_budget: 'Current Total Budget', budget_target: 'Budget Target' };
-    ['current_total_hc','current_total_budget','headcount_target','budget_target'].forEach(k => {
-      const el = document.getElementById(`wdiv-${k}`);
-      const isHC = k.endsWith('_hc') || k === 'headcount_target';
-      const r = isHC ? readWholeCount(el?.value) : readMoney(el?.value);
-      if (r.missing) errors.push(`${labels[k]} is required`);
-      else if (r.invalid) errors.push(isHC ? `${labels[k]} must be a whole number, 0 or more` : `${labels[k]} must be an amount, 0 or more`);
-      else updates[k] = r.value;
-    });
-    if (errors.length) { toast('Not saved', { type: 'error', description: errors.join('. ') + '.' }); return; }
-    updDiv(state.selectedDivisionId, updates);
-    state.editingDivision = false;
-    state._divEditForm = null;
+    if (key !== 'headcount_target' && key !== 'budget_target') return;
+    const isHC = key === 'headcount_target';
+    const r = isHC ? readWholeCount(value) : readMoney(value);
+    const label = isHC ? 'Headcount Target' : 'Budget Target';
+    if (r.invalid) { toast('Not saved', { type: 'error', description: isHC ? `${label} must be a whole number, 0 or more.` : `${label} must be an amount, 0 or more.` }); renderWorkspace(); return; }
+    updDiv(state.selectedDivisionId, { [key]: r.missing ? null : r.value });
     renderWorkspace();
     toast('Saved');
   },
-
-  cancelDivisionEdit() { state.editingDivision = false; state._divEditForm = null; renderWorkspace(); },
 
   // === AS-IS FUNCTIONS ===
   addAsIsRow() {
@@ -6905,6 +7030,8 @@ const app = {
     const row = state.asIsNewRows.find(r => r.id === id);
     if (!row) return;
     if (!String(row.name || '').trim()) { toast('Function title is required', { type: 'error' }); return; }
+    const titleClash = findTitleClash(getAsIs().filter(f => f.division_id === state.selectedDivisionId), row.name, 'function_name');
+    if (titleClash) { toast('Not saved', { type: 'error', description: titleTakenMessage(titleClash.function_name, 'structure') }); return; }
     row.name = String(row.name).trim();
     this._createAsIsFromRow(state.selectedDivisionId, row);
     state.asIsNewRows = state.asIsNewRows.filter(r => r.id !== id);
@@ -6949,6 +7076,8 @@ const app = {
       return;
     }
     if (field === 'function_name' && !String(value || '').trim()) { toast('Function title is required', { type: 'error' }); renderWorkspace(); return; }
+    const titleClash = field === 'function_name' ? findTitleClash(divFns, value, 'function_name', id) : null;
+    if (titleClash) { toast('Not saved', { type: 'error', description: titleTakenMessage(titleClash.function_name, 'structure') }); renderWorkspace(); return; }
     updAsIsFn(id, { [field]: typeof value === 'string' ? value.trim() : value });
   },
 
@@ -6961,6 +7090,8 @@ const app = {
     const fn = getAsIs().find(f => f.id === id);
     if (!fn) return;
     if (!String(edit.name || '').trim()) { toast('Function title is required', { type: 'error' }); return; }
+    const titleClash = findTitleClash(getAsIs().filter(f => f.division_id === fn.division_id), edit.name, 'function_name', id);
+    if (titleClash) { toast('Not saved', { type: 'error', description: titleTakenMessage(titleClash.function_name, 'structure') }); return; }
     edit.name = String(edit.name).trim();
     const nt = { mgr: cleanCount(edit.mgr), emp: cleanCount(edit.emp), mc: cleanMoney(edit.mgrcost), pc: cleanMoney(edit.profcost) };
     const parentId = edit.parentId || null;
@@ -7057,58 +7188,20 @@ const app = {
   saveAllAsIs() {
     if (isReadOnlyViewer()) { toast('View only', { type: 'error' }); return; }
     const pending = [...state.asIsNewRows];
+    const refused = [];
     pending.forEach(row => {
-      if (String(row.name || '').trim()) { row.name = String(row.name).trim(); this._createAsIsFromRow(state.selectedDivisionId, row); }
+      if (!String(row.name || '').trim()) return;
+      const titleClash = findTitleClash(getAsIs().filter(f => f.division_id === state.selectedDivisionId), row.name, 'function_name');
+      if (titleClash) { refused.push({ row, taken: titleClash.function_name }); return; }
+      row.name = String(row.name).trim(); this._createAsIsFromRow(state.selectedDivisionId, row);
     });
-    state.asIsNewRows = [];
+    state.asIsNewRows = refused.map(x => x.row);
+    if (refused.length) toast('Not saved', { type: 'error', description: refused.map(x => titleTakenMessage(x.taken, 'structure')).join(' ') });
 
-    const div = getDivs().find(d => d.id === state.selectedDivisionId);
-    if (!div) { renderWorkspace(); return; }
-    const asIsFns = getAsIs().filter(f => f.division_id === div.id);
-    // Root-level only: a sub-function's HC/budget is nested inside the parent function it's
-    // grouped under, not additive to it (same rule as the TO-BE workshop functions), so only
-    // functions attached directly to the division should be checked against the division's
-    // single Current Total HC/Budget — otherwise every nested function inflates the sum and the
-    // check fails even when the entered numbers are actually consistent.
-    const asIsFnIds = new Set(asIsFns.map(f => f.id));
-    const rootAsIsFns = asIsFns.filter(f => !(f.parent_id && asIsFnIds.has(f.parent_id)));
-    const totalHC = rootAsIsFns.reduce((s, f) => s + (f.current_function_hc || 0), 0);
-    const totalBudget = rootAsIsFns.reduce((s, f) => s + (f.current_budget || 0), 0);
-
-    // Root cause of "clicking Save All Functions does nothing" reports: this used window.confirm()
-    // for the budget/HC mismatch check, the same native-dialog issue already fixed for
-    // Delete Division/Workshop/AS-IS elsewhere in this file (browsers can silently auto-decline
-    // repeated confirm() calls, especially in embedded/automated contexts, with zero visible
-    // feedback) — replaced with the app's own showConfirmDialog, combining both checks into one
-    // dialog instead of two sequential native prompts.
-    const issues = [];
-    // Compared at qapik precision. Summing decimal amounts in binary floating point leaves a
-    // residue (0.1 + 0.2 is famously not 0.3), so a strict !== flagged budgets that are equal to
-    // the last qapik — the dialog printed the same number twice and said they did not match.
-    if (roundMoney(totalBudget) !== roundMoney(parseFloat(div.current_total_budget || 0))) {
-      issues.push(`Sum of function budgets (${formatNumber(totalBudget)}) does not match Current Total Budget (${formatNumber(div.current_total_budget || 0)}).`);
-    }
-    if (totalHC !== parseFloat(div.current_total_hc || 0)) {
-      issues.push(`Sum of function HC (${formatNumber(totalHC)}) does not match Current Total Headcount (${formatNumber(div.current_total_hc || 0)}).`);
-    }
-
-    renderWorkspace();
-    if (issues.length > 0) {
-      showConfirmDialog({
-        title: 'Validation Warning',
-        message: issues.join('\n\n') + '\n\nSave anyway, or cancel to edit the numbers?',
-        confirmLabel: 'Save Anyway',
-        cancelLabel: 'Cancel',
-        danger: true,
-        onConfirmAttr: 'app.finalizeSaveAllAsIs()',
-      });
-      return;
-    }
     this.finalizeSaveAllAsIs();
   },
 
-  // Split out of saveAllAsIs so the "Save Anyway" button on the validation-warning dialog can
-  // reach it too -- both paths (no mismatch, or user proceeds despite one) end up here.
+  // The current totals are calculated from the functions now, so there is nothing to compare first.
   finalizeSaveAllAsIs() {
     state.asIsSaved = true;
     renderWorkspace();
@@ -7302,6 +7395,11 @@ const app = {
   hideWorkshopDialog() { document.getElementById('workshop-dialog').classList.add('hidden'); },
 
   startNewWorkshop() {
+    if (!divTargetsSet(getDivs().find(d => d.id === state.selectedDivisionId))) {
+      this.hideWorkshopDialog();
+      toast('Workshop not started', { type: 'error', description: 'Set Headcount Target and Budget Target first.' });
+      return;
+    }
     const ws = addWs(state.selectedDivisionId);
     state.selectedWorkshopId = ws.id;
     state.editingValues = {};
@@ -7312,6 +7410,17 @@ const app = {
   },
 
   copyAsIsBaselineWorkshop() {
+    if (!divTargetsSet(getDivs().find(d => d.id === state.selectedDivisionId))) {
+      this.hideWorkshopDialog();
+      toast('Workshop not started', { type: 'error', description: 'Set Headcount Target and Budget Target first.' });
+      return;
+    }
+    const dupTitles = duplicateTitles(getAsIs().filter(f => f.division_id === state.selectedDivisionId), 'function_name');
+    if (dupTitles.length) {
+      this.hideWorkshopDialog();
+      toast('Workshop not started', { type: 'error', description: `These AS-IS function titles are used more than once: ${dupTitles.join(', ')}. Rename them in Current Functions first.` });
+      return;
+    }
     const ws = copyAsIsBaselineToWorkshop(state.selectedDivisionId);
     if (!ws) return;
     state.selectedWorkshopId = ws.id;
@@ -7343,6 +7452,7 @@ const app = {
     state.p3ExpandedChildren = new Set();
     this.hideWorkshopDialog();
     updWs(id, { status: 'draft' });
+    wfCostsToPercents(id);   // normal workshop only: older typed Proposed Costs become exact Cost %
     // Stored 3 = allocation; anything earlier (incl. legacy 2, the old Business Impact step) = merged Phase 1.
     if (phase === 3) { showPage('phase3'); renderPhase3(); }
     else { showPage('phase1'); renderPhase1(); }
@@ -7482,12 +7592,27 @@ const app = {
     renderFunctionModal();
   },
 
+  // Live message under Function Name while typing (no re-render, so the cursor stays put).
+  checkFnModalTitle(value) {
+    const m = state.fnModal;
+    const el = document.getElementById('fn-modal-name-error');
+    if (!m || !el) return;
+    const fns = getFns().filter(f => f.workshop_id === state.selectedWorkshopId);
+    const clash = findTitleClash(fns, value, 'proposed_function_name', m.mode === 'edit' ? m.fnId : null);
+    el.textContent = clash ? titleTakenMessage(clash.proposed_function_name, 'workshop') : '';
+    el.hidden = !clash;
+  },
+
   saveFunctionModal() {
     const m = state.fnModal;
     if (!m) return;
     const d = m.draft;
     if (!d.proposed_function_name || !d.proposed_function_name.trim()) {
       toast('Function name is required', { type: 'error' }); return;
+    }
+    const titleClash = findTitleClash(getFns().filter(f => f.workshop_id === state.selectedWorkshopId), d.proposed_function_name, 'proposed_function_name', m.mode === 'edit' ? m.fnId : null);
+    if (titleClash) {
+      toast('Not saved', { type: 'error', description: titleTakenMessage(titleClash.proposed_function_name, 'workshop') }); return;
     }
     if (!d.career_level) { toast('Management Layer is required', { type: 'error' }); return; }
     if (!d.function_structure_type) { toast('Structure Type is required', { type: 'error' }); return; }
@@ -7656,6 +7781,8 @@ const app = {
     if (!ws || !div) return { blocking: 'Workshop not found.', warnings: [] };
     const fns = freshWorkshopFns(ws);
     if (!fns.length) return { blocking: 'This workshop has no functions yet. Add functions in Phase 1 first.', warnings: [] };
+    const dupTitles = duplicateTitles(fns, 'proposed_function_name');
+    if (dupTitles.length) return { blocking: `These function names are used more than once: ${dupTitles.join(', ')}. Rename them in Phase 1 before completing the workshop.`, warnings: [] };
     const warnings = [];
     const undecided = fns.filter(f => !decisionOf(f));
     if (undecided.length) warnings.push(`${undecided.length} of ${fns.length} functions ${undecided.length === 1 ? 'has' : 'have'} no ZBOD decision (Q1/Q2 not answered)`);
@@ -7959,8 +8086,8 @@ const app = {
         ['Prepared By', creatorDisplayName],
         ['Prepared By — Position', creatorDisplayPosition],
         ['Prepared By — Email', div.creator_email || ''],
-        ['Current Total Headcount', div.current_total_hc || 0, '#,##0'],
-        ['Current Total Budget (AZN)', div.current_total_budget || 0, '#,##0'],
+        ['Current Total Headcount', asIsCurrentTotals(asIsFns).hc, '#,##0'],
+        ['Current Total Budget (AZN)', asIsCurrentTotals(asIsFns).budget, '#,##0'],
         ['Headcount Target', div.headcount_target || 0, '#,##0'],
         ['Budget Target (AZN)', div.budget_target || 0, '#,##0'],
         ['Number of AS-IS Functions (as of export)', asIsFns.length],
@@ -8480,6 +8607,62 @@ const app = {
         });
         sh8.getRow(r).height = 18; r++;
       });
+
+      // ════════════════════════════════════════════════════════════════
+      // SHEET 9 — AS-IS FUNCTION REGISTER
+      // ════════════════════════════════════════════════════════════════
+      // The structure's AS-IS functions in the exact layout of the "Function Register" file the AS-IS
+      // data is autofilled from (same title, note, headers, colours and column widths), so it reads
+      // like that file and can be uploaded again. The ROOT row is the structure; every function is
+      // listed under its parent, parents in bold. Figures are the stored AS-IS values.
+      const sh9 = workbook.addWorksheet('9. AS-IS Function Register');
+      sh9.views = [{ state: 'frozen', ySplit: 6, xSplit: 0 }];
+      sh9.columns = [{ width: 8 }, { width: 43.9 }, { width: 36.3 }, { width: 12 }, { width: 14 }, { width: 26.3 }, { width: 13 }];
+      const rgBorder = mkBorder('thin', 'FFD1D5DB');
+      const rgFont = (opts) => mkFont({ name: 'Arial', size: 10, color: { argb: 'FF1A1A2E' }, ...opts });
+      const rgCell = (row, col, value, style) => { const c = sh9.getCell(row, col); c.value = value; applyStyle(c, style); return c; };
+      sh9.mergeCells('A1:E1');
+      rgCell(1, 1, "CURRENT FUNCTIONS (AS-IS BASELINE) — DATA ENTRY TEMPLATE", { font: rgFont({ bold: true, size: 14, color: { argb: 'FFFFFFFF' } }), fill: mkFill('FF184016'), alignment: mkAlign('left', 'middle') });
+      sh9.getRow(1).height = 28.2;
+      sh9.mergeCells('A2:E5');
+      rgCell(2, 1, "Fill in the cream cells only, one row per function. Do not add, remove, rename, or reorder columns — the upload only recognizes these exact column headers.\n\nRow 7 (\"ROOT\") is the top of this division's function tree — enter only its name (e.g. the division head's office). Its other cells are locked: the root itself is not a function with its own headcount or cost, and is not created by this upload — you set it up yourself inside the ZBOD tool.\n\nParent Function (for every other row): type or pick the exact Function Title of the row this function reports into — including \"ROOT\" for anything reporting straight to the top — or leave blank if it reports directly to the division itself.\n\nDo not add percentage, \"Actual HC\", \"Actual Cost\", or \"TOTAL\" columns/rows — allocation percentages and totals are calculated automatically inside the ZBOD tool once you upload this file, not in Excel.", { font: rgFont({ color: { argb: 'FF6B7280' } }), alignment: mkAlign('left', 'top', true) });
+      [2, 3, 4, 5].forEach(n => { sh9.getRow(n).height = 19.95; });
+      ["#", "Function Title", "Parent Function", "Managers", "Professionals", "Managers Cost (AZN)", " Professionals Cost (AZN)"].forEach((h, i) => rgCell(6, i + 1, h, { font: rgFont({ bold: true, color: { argb: 'FFFFFFFF' } }), fill: mkFill('FF2E642C'), alignment: mkAlign('center', 'middle', true), border: rgBorder }));
+      sh9.getRow(6).height = 30;
+      const rgRootName = div.structure_name || 'Division';
+      rgCell(7, 1, 'ROOT', { font: rgFont({ bold: true, color: { argb: 'FFFFFFFF' } }), fill: mkFill('FF0F3C76'), alignment: mkAlign('center', 'middle'), border: rgBorder });
+      rgCell(7, 2, rgRootName, { font: rgFont({ color: { argb: 'FF6B7280' } }), fill: mkFill('FFFFF7D6'), alignment: mkAlign('left', 'middle'), border: rgBorder });
+      rgCell(7, 3, '\u2014', { font: rgFont({ color: { argb: 'FF6B7280' } }), fill: mkFill('FFE5E7EB'), alignment: mkAlign('center', 'middle'), border: rgBorder });
+      [4, 5, 6, 7].forEach(c => { applyStyle(sh9.getCell(7, c), { fill: mkFill('FFE5E7EB'), border: rgBorder }); });
+      sh9.getRow(7).height = 19.95;
+      // Tree order: each function straight after its parent. Anything a parent loop would hide is
+      // added at the end, so every AS-IS function is listed exactly once.
+      const rgKids = {};
+      asIsFns.forEach(f => { const pid = f.parent_id && asIsFnIds.has(f.parent_id) ? f.parent_id : 'root'; (rgKids[pid] = rgKids[pid] || []).push(f); });
+      const rgOrder = [], rgSeen = new Set();
+      const rgWalk = pid => (rgKids[pid] || []).forEach(f => { if (rgSeen.has(f.id)) return; rgSeen.add(f.id); rgOrder.push(f); rgWalk(f.id); });
+      rgWalk('root');
+      asIsFns.forEach(f => { if (!rgSeen.has(f.id)) { rgSeen.add(f.id); rgOrder.push(f); rgWalk(f.id); } });
+      let rgRow = 8;
+      rgOrder.forEach(f => {
+        const isParent = !!(rgKids[f.id] && rgKids[f.id].length);
+        const parentFn = f.parent_id && asIsFnIds.has(f.parent_id) ? asIsById[f.parent_id] : null;
+        const data = { font: rgFont({ bold: isParent }), fill: mkFill('FFFFF7D6'), border: rgBorder };
+        rgCell(rgRow, 1, null, { font: rgFont({ bold: isParent, color: { argb: 'FF6B7280' } }), fill: mkFill('FFFFFFFF'), alignment: mkAlign('center', 'middle'), border: rgBorder });
+        rgCell(rgRow, 2, f.function_name || '', { ...data, alignment: mkAlign('left', 'middle') });
+        rgCell(rgRow, 3, parentFn ? (parentFn.function_name || '') : rgRootName, { ...data, alignment: mkAlign('left', 'middle') });
+        rgCell(rgRow, 4, f.manager_count || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0';
+        rgCell(rgRow, 5, f.current_employee_count || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0';
+        rgCell(rgRow, 6, f.managers_cost || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0.00';
+        rgCell(rgRow, 7, f.professionals_cost || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0.00';
+        sh9.getRow(rgRow).height = 18;
+        rgRow++;
+      });
+      // Parent Function offers the titles above as a list, as in the template.
+      const rgLast = Math.max(rgRow - 1, 7);
+      for (let rr = 8; rr <= rgLast; rr++) {
+        sh9.getCell(rr, 3).dataValidation = { type: 'list', allowBlank: true, formulae: [`$B$7:$B$${rgLast}`] };
+      }
 
       // ════════════════════════════════════════════════════════════════
       // Write file
