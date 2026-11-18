@@ -213,6 +213,119 @@ async function sbUpsert(table, payload, onConflict) {
   return null;
 }
 
+// ═══════════════════════════════════════════
+// CHANGED-FIELDS WRITES (two people on the same structure)
+// A save used to send the whole row. A device that had not refreshed then wrote back its old copy
+// of every column, so another person's change to a different field was undone (HRBP sets the HC
+// target, Admin then sets the budget from an older page: the HC target went back). Now only the
+// fields this save changed are sent, and only while the cloud still holds the values this device
+// started from. If someone else changed them meanwhile:
+// - AS-IS figures are added up (both people's changes are kept: +1 and +1 under one parent = +2);
+// - a completed workshop is never turned back into a draft;
+// - any other field: this save wins for the fields it changed (the others are not touched).
+// A row the cloud does not have yet, an offline save or a rejected one takes the whole-row path
+// above (retry queue, warnings) exactly as before.
+// ═══════════════════════════════════════════
+const SB_ADDITIVE = {
+  as_is_functions: ['manager_count', 'current_employee_count', 'current_function_hc', 'managers_cost', 'professionals_cost', 'current_budget'],
+};
+let sbOnRebased = null;
+function sbSetRebasedHandler(fn) { sbOnRebased = fn; }
+// The cloud can hold the same value in another form (an empty text as null, 12.5 as "12.50", a
+// time with another zone). That is not someone else's change.
+function sbSameValue(a, b) {
+  const empty = x => x === null || x === undefined || x === '';
+  if (empty(a) || empty(b)) return empty(a) && empty(b);
+  if (typeof a === 'object' || typeof b === 'object') return JSON.stringify(a) === JSON.stringify(b);
+  const na = Number(a), nb = Number(b);
+  if (String(a).trim() !== '' && String(b).trim() !== '' && isFinite(na) && isFinite(nb)) {
+    return Math.abs(na - nb) <= 1e-6 * Math.max(1, Math.abs(na), Math.abs(nb));
+  }
+  if (String(a).trim() === String(b).trim()) return true;
+  if (/^\d{4}-\d\d-\d\d/.test(String(a)) && /^\d{4}-\d\d-\d\d/.test(String(b))) {
+    const ta = Date.parse(a), tb = Date.parse(b);
+    return isFinite(ta) && ta === tb;
+  }
+  return String(a).toLowerCase() === String(b).toLowerCase() && /^(true|false)$/i.test(String(a));
+}
+async function sbPatchRow(table, full, change) {
+  if (!supabase || !supabaseAvailable) return null;
+  const id = full && full.id;
+  // A row still waiting in the retry queue (or deleted here) goes whole, as before: it carries this change too.
+  if (id == null || !change || sbOutboxHas(table, id) || sbIsTombstoned(table, id)) return sbUpsert(table, full, 'id');
+  let patch = { ...change.patch }, base = { ...change.base };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let res;
+    try {
+      let q = supabase.from(table).update(patch).eq('id', id);
+      Object.keys(base).forEach(k => {
+        const v = base[k];
+        if (v === null || v === undefined) q = q.is(k, null);
+        else if (typeof v !== 'object') q = q.eq(k, v);
+      });
+      res = await q.select('id');
+    } catch (e) { res = { error: e }; }
+    if (res && res.error) {
+      const col = sbMissingColumn(res.error);
+      if (col && col in patch) {
+        try { if (sbOnSchemaGap) sbOnSchemaGap(table, col); } catch (_) {}
+        delete patch[col]; delete base[col];
+        if (!Object.keys(patch).some(k => k !== 'updated_at')) return true;
+        continue;
+      }
+      return sbUpsert(table, full, 'id');
+    }
+    if (res && res.data && res.data.length) return true;
+    // Nothing matched: the row is not in the cloud yet, or someone changed these fields meanwhile.
+    let cur = null;
+    try {
+      const r = await supabase.from(table).select('*').eq('id', id);
+      if (r.error) throw r.error;
+      cur = (r.data || [])[0] || null;
+    } catch (_) { return sbUpsert(table, full, 'id'); }
+    if (!cur) return sbUpsert(table, full, 'id');
+    // Nobody changed these fields, the cloud only stores them in another form: write them as they are.
+    if (Object.keys(base).every(k => sbSameValue(cur[k], base[k]))) {
+      try {
+        const { error } = await supabase.from(table).update(patch).eq('id', id);
+        if (error) throw error;
+        return true;
+      } catch (_) { return sbUpsert(table, full, 'id'); }
+    }
+    const add = SB_ADDITIVE[table] || [];
+    try {
+      const diff = Object.keys(base).filter(k => !sbSameValue(cur[k], base[k])).map(k => `${k}: here ${JSON.stringify(base[k])}, cloud ${JSON.stringify(cur[k])}`);
+      console.warn(`[sync] ${table} ${id} changed in the cloud meanwhile:`, diff.join('; '));
+    } catch (_) {}
+    const merged = {};
+    Object.keys(patch).forEach(k => {
+      const isNum = x => typeof x === 'number' && isFinite(x);
+      if (add.includes(k) && isNum(patch[k]) && isNum(base[k]) && isNum(Number(cur[k]))) {
+        merged[k] = Math.round((Number(cur[k]) + patch[k] - base[k]) * 100) / 100;
+      } else merged[k] = patch[k];
+    });
+    // This computer's copy takes only the merged fields (a newer change still in the queue stays).
+    // The user is told only when another person's change was really kept next to this one.
+    const toLocal = { id, ...merged };
+    let kept = Object.keys(merged).some(k => add.includes(k) && !sbSameValue(merged[k], patch[k]));
+    if (table === 'workshops' && cur.status === 'completed' && 'status' in merged && merged.status !== 'completed') {
+      delete merged.status; delete merged.phase;
+      Object.assign(toLocal, { status: cur.status, phase: cur.phase, completed_at: cur.completed_at });
+      kept = true;
+    }
+    try { if (sbOnRebased && kept) sbOnRebased(table, toLocal); } catch (_) {}
+    if (!Object.keys(merged).some(k => k !== 'updated_at')) return true;
+    patch = merged;
+    base = {}; Object.keys(merged).forEach(k => { if (k !== 'updated_at') base[k] = cur[k] === undefined ? null : cur[k]; });
+  }
+  // Still changing under us after three tries: write the fields plainly.
+  try {
+    const { error } = await supabase.from(table).update(patch).eq('id', id);
+    if (error) throw error;
+    return true;
+  } catch (_) { return sbUpsert(table, full, 'id'); }
+}
+
 // Deletes follow the same rule: a delete that failed is remembered and re-sent, and any pending
 // upsert of the same row is replaced (the delete is the newer intent).
 async function sbDeleteRow(table, column, id) {
@@ -327,8 +440,8 @@ async function sbLoadDivisions() {
   return sbRun(db => db.from('divisions').select('*').order('created_at', { ascending: true }));
 }
 
-async function sbSaveDivision(division) {
-  return sbQueueWrite(() => sbUpsert('divisions', division, 'id'));
+async function sbSaveDivision(division, change) {
+  return sbQueueWrite(() => (change ? sbPatchRow('divisions', division, change) : sbUpsert('divisions', division, 'id')));
 }
 
 async function sbDeleteDivision(id) {
@@ -342,8 +455,18 @@ async function sbLoadWorkshops() {
   return sbRun(db => db.from('workshops').select('*').order('created_at', { ascending: true }));
 }
 
-async function sbSaveWorkshop(workshop) {
-  return sbQueueWrite(() => sbUpsert('workshops', workshop, 'id'));
+async function sbSaveWorkshop(workshop, change) {
+  return sbQueueWrite(() => (change ? sbPatchRow('workshops', workshop, change) : sbUpsert('workshops', workshop, 'id')));
+}
+
+// One row as the cloud has it now (null when offline or not there).
+async function sbFetchRow(table, id) {
+  if (!supabase || !supabaseAvailable) return null;
+  try {
+    const { data, error } = await supabase.from(table).select('*').eq('id', id);
+    if (error) return null;
+    return (data || [])[0] || null;
+  } catch (_) { return null; }
 }
 
 async function sbDeleteWorkshop(id) {
@@ -376,8 +499,8 @@ async function sbLoadFunctions() {
   return sbRun(db => db.from('workshop_functions').select('*').order('function_number', { ascending: true }));
 }
 
-async function sbSaveFunction(fn) {
-  return sbQueueWrite(() => sbUpsert('workshop_functions', fn, 'id'));
+async function sbSaveFunction(fn, change) {
+  return sbQueueWrite(() => (change ? sbPatchRow('workshop_functions', fn, change) : sbUpsert('workshop_functions', fn, 'id')));
 }
 
 async function sbDeleteFunction(id) {
@@ -391,8 +514,8 @@ async function sbLoadAsIsFunctions() {
   return sbRun(db => db.from('as_is_functions').select('*').order('created_at', { ascending: true }));
 }
 
-async function sbSaveAsIsFunction(fn) {
-  return sbQueueWrite(() => sbUpsert('as_is_functions', fn, 'id'));
+async function sbSaveAsIsFunction(fn, change) {
+  return sbQueueWrite(() => (change ? sbPatchRow('as_is_functions', fn, change) : sbUpsert('as_is_functions', fn, 'id')));
 }
 
 async function sbDeleteAsIsFunction(id) {
@@ -629,6 +752,8 @@ window.zbodSupabase = {
   sbSetRecoveredHandler,
   sbSetSchemaGapHandler,
   sbSetParentResolver,
+  sbSetRebasedHandler,
+  sbFetchRow,
   sbGetFailedWriteCount,
   sbGetLastError,
   sbFlushOutbox,

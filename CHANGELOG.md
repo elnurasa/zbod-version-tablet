@@ -2,6 +2,57 @@
 
 Notable implemented features, in the order the codebase evolved. Dates reflect the working session in which each change was made.
 
+## 2026-11-18 — New Workshop, Phase 2: managers and professionals of sub-functions never exceed the parent's
+
+- A parent's sub-functions take their managers, and in the same way their professionals, out of the parent's own Proposed Managers / Proposed Professionals. Together they cannot hold more of either than the parent has. A number that would break this is **not saved**: the box goes back to what it was, and a red message says why ("No managers left in COE: all 4 are already allocated to its sub-functions", or "Only 2 professionals left in COE: it has 10, and 8 are already allocated to its other sub-functions").
+- When none are left, the box of the next sub-function is locked (greyed out) if it holds nothing. Its label says "none left in [parent]", and otherwise "max N".
+- The parent's number cannot be lowered below what its sub-functions hold ("cannot have fewer professionals than its sub-functions hold (10)").
+- Managers and professionals are checked separately. An empty box on the parent means "not entered yet": no limit. 0 is a real limit.
+- Older data that is already over the limit is not locked: lowering is accepted, raising is refused.
+- New Workshop only: AS-IS Baseline workshops are not affected.
+
+## 2026-11-18 — Phase 2: the structure's scale in the sticky bar
+
+- Phase 2 (normal and AS-IS Baseline workshops): the bar that stays at the top while scrolling now also shows the structure's own HC and Budget scale ("Allocating within [structure name]") when the reader is among the top-level functions, those that report straight to the structure. Before, it showed a scale only inside a parent's sub-function section, and disappeared on the top-level functions.
+- The structure's summary card at the top of the page is read in place: while it is on screen, the bar stays hidden. Inside a parent's section the bar still shows that parent's scale. When the section ends, it goes back to the structure's.
+
+## 2026-11-17 — Edit a completed workshop as a new version
+
+- History, completed New Workshop: a new **Edit as new version** button. It starts a new draft that is an exact copy of that workshop: every Phase 1 answer (functions, parents, layer, structure type, opportunity answers, Q1/Q2) and every Phase 2 value (HC % and Cost %, Proposed HC and Cost, managers, professionals). The draft opens in Phase 1.
+- Completing the draft adds a separate workshop to History. The original workshop does not change.
+- The draft and its History card say which workshop it came from: "Version of Workshop #…".
+- With the same structure targets, every figure is the same to the qəpik. If the targets have changed since, a message says so: the % are kept, and Proposed HC and Cost follow the current targets.
+- Only one draft at a time: if a draft is open, the user is asked to resume or delete it first.
+- AS-IS Baseline workshops do not get this button.
+- Saving which workshop a version came from needs `supabase_workshop_history.sql` (the same file as the AS-IS copy).
+
+## 2026-11-17 — Report and workshop fixes
+
+- Excel sheet 7: "Change %" is measured from the AS-IS. A normal workshop shows "Proposed vs AS-IS" (57 → 48 = −15.8%), and an AS-IS Baseline workshop shows "Target vs AS-IS". Before, it was the difference to the target divided by the target (+18.75% or 0).
+- Excel sheets 6 and 7, decision groups: every function is counted, each person once. A function counts what it holds beyond its sub-functions, and they count in their own group. Before, only top-level functions were counted, so a parent's whole team fell under the parent's decision.
+- Executive Summary: in an AS-IS Baseline workshop the Within/Over Target status judges the proposal shown in the table, not the AS-IS column.
+- A completed workshop keeps a copy of the AS-IS it was compared with. An AS-IS Baseline workshop keeps the copy taken when it was created. A later upload or edit of the structure's AS-IS no longer changes an old programme's AS-IS side, its dashboard or its Excel report. This needs `supabase_workshop_history.sql` to be run once in Supabase. Until then, it behaves as before.
+- AS-IS Baseline workshop, red "Unallocated from AS-IS data" note: every function's amount is frozen at copy time (0 where there was none). Moving functions later no longer makes a note appear on a parent that had none.
+- AS-IS Baseline workshop: after a structure target changes, the % next to each figure updates at once (the figures stay).
+- Normal workshop, moving a function after allocation: its HC % is stored as exactly as needed. The moved function and the sub-functions already under its new parent keep their people (S stayed 4 instead of becoming 3).
+- Money with qəpik always shows 2 decimals on screen (28 330.50, not 28 330.5). In Excel, such amounts show their decimals; whole amounts look as before.
+- Tab no longer stops on the "?" help buttons, so no focus frame appears on them after typing a target. They still open with a click.
+
+## 2026-11-17 — Critical fixes: AS-IS figures, Excel import, two people at the same time
+
+- AS-IS figures: managers and professionals are one people pool, and the two costs are one cost pool. When a sub-function grows, the parent first uses its own unallocated amount of the same kind, then the other kind's. No parent goes down because something under it grew. A function that is moved or deleted takes its figures out of every parent in full. Before this, a parent could lose a person or 1 000 AZN in these cases (for example Customer Care 20 → 19).
+- Excel import:
+  - A parent row below the sum of its sub-functions is raised to that sum and reported. This covers a subtotal that was not updated and a row that holds only the head.
+  - A file without a ROOT row: the root is now the parent name that the top functions (the ones with sub-functions) report into. A misspelt parent name is reported with the closest title ("did you mean …?") and the rows that use it.
+  - Number cells are read as numbers: an Excel residue such as 1.1368E-13 becomes 0. Before, it became 1.14 AZN or 3 managers.
+  - Text that can mean two amounts ("85000,50", "85.000") is set to 0 and reported, never stored as a guess. More than 2 decimals are rounded and reported.
+  - When a function has the same title as the structure, the report's sheet 9 leaves Parent Function blank for top-level rows, so the sheet uploads back the same.
+- Two people on the same structure:
+  - A save sends only the fields it changed, and only if the cloud still has the old values. Another person's change to a different field is no longer undone by a page that was not refreshed.
+  - AS-IS figures changed at the same time are added together, so +1 and +1 under one parent = +2. The user is told and asked to refresh.
+  - A workshop completed on another computer cannot be turned back into a draft by an older page. Resume checks the cloud first.
+  - Sign Out warns when changes have not reached the cloud yet (no connection), instead of losing them silently.
+
 ## 2026-11-16 — Structure figures: current calculated, targets set on the structure page
 
 - Add New Structure asks only for Structure Name, Structure Type and C-Level Full Name. No figures are entered when a structure is created.

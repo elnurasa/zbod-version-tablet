@@ -291,7 +291,9 @@ function formatNumber(num) {
   const n = typeof num === 'string' ? num.replace(/\s/g, '') : num;
   const val = parseFloat(n);
   if (isNaN(val)) return num;
-  return val.toLocaleString('en-US').replace(/,/g, ' ');
+  // people are whole; an amount with qapik always shows 2 decimals (28 330.50, not 28 330.5)
+  const opts = Number.isInteger(roundMoney(val)) ? {} : { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+  return val.toLocaleString('en-US', opts).replace(/,/g, ' ');
 }
 
 function computeMedian(values) {
@@ -360,7 +362,9 @@ function formatMoneyValue(v) {
   if (v === null || v === undefined || v === '') return '';
   const n = parseMoney(v);
   if (!n) return '';
-  return formatMoneyTyping(String(roundMoney(n)));
+  // qapik always as 2 decimals (28,330.50, not 28,330.5); whole amounts as before
+  const r = roundMoney(n);
+  return formatMoneyTyping(Number.isInteger(r) ? String(r) : r.toFixed(2));
 }
 
 // Headcount is whole people, 0 or more; empty is "missing", not 0.
@@ -481,6 +485,21 @@ function getVisibleDivs() {
   return getDivs().filter(d => (d.owner_email || '').toLowerCase() === email);
 }
 
+// The fields a save changes, with the values this device had before, so supabase.js can send just
+// those and notice when another person changed them meanwhile. null = nothing changed.
+function syncChange(prev, next) {
+  if (!prev || !next) return null;
+  const patch = {}, base = {};
+  Object.keys(next).forEach(k => {
+    if (k === 'updated_at' || k === 'id') return;
+    if (JSON.stringify(prev[k]) === JSON.stringify(next[k])) return;
+    patch[k] = next[k]; base[k] = prev[k] === undefined ? null : prev[k];
+  });
+  if (!Object.keys(patch).length) return null;
+  patch.updated_at = next.updated_at;
+  return { patch, base };
+}
+
 function addDiv(data) {
   const divs = getDivs(); const now = new Date().toISOString();
   const d = { id: genId(), ...data, created_at: now, updated_at: now };
@@ -489,10 +508,12 @@ function addDiv(data) {
   return d;
 }
 function updDiv(id, updates) {
+  const prev = getDivs().find(d => d.id === id);
   const divs = getDivs().map(d => d.id === id ? {...d, ...updates, updated_at: new Date().toISOString()} : d);
   lsSet(LS.divisions, divs);
   const updated = divs.find(d => d.id === id);
-  if (updated && window.zbodSupabase) window.zbodSupabase.sbSaveDivision(updated);
+  const change = syncChange(prev, updated);
+  if (updated && change && window.zbodSupabase) window.zbodSupabase.sbSaveDivision(updated, change);
 }
 function delDiv(id) {
   lsSet(LS.divisions, getDivs().filter(d => d.id !== id));
@@ -512,10 +533,12 @@ function addWs(divisionId) {
   return w;
 }
 function updWs(id, updates) {
+  const prev = getWs().find(w => w.id === id);
   const workshops = getWs().map(w => w.id === id ? {...w, ...updates, updated_at: new Date().toISOString()} : w);
   lsSet(LS.workshops, workshops);
   const updated = workshops.find(w => w.id === id);
-  if (updated && window.zbodSupabase) window.zbodSupabase.sbSaveWorkshop(updated);
+  const change = syncChange(prev, updated);
+  if (updated && change && window.zbodSupabase) window.zbodSupabase.sbSaveWorkshop(updated, change);
 }
 async function delWs(id) {
   if (window.zbodSupabase) {
@@ -541,10 +564,12 @@ function addFn(workshopId, num) {
   return fn;
 }
 function updFn(id, updates) {
+  const prev = getFns().find(f => f.id === id);
   const fns = getFns().map(f => f.id === id ? {...f, ...updates, updated_at: new Date().toISOString()} : f);
   lsSet(LS.functions, fns);
   const updated = fns.find(f => f.id === id);
-  if (updated && window.zbodSupabase) window.zbodSupabase.sbSaveFunction(updated);
+  const change = syncChange(prev, updated);
+  if (updated && change && window.zbodSupabase) window.zbodSupabase.sbSaveFunction(updated, change);
 }
 function delFn(id) {
   lsSet(LS.functions, getFns().filter(f => f.id !== id));
@@ -586,10 +611,12 @@ function addAsIsFn(divisionId, name, id) {
   return fn;
 }
 function updAsIsFn(id, updates) {
+  const prev = getAsIs().find(f => f.id === id);
   const ais = getAsIs().map(f => f.id === id ? {...f, ...updates, updated_at: new Date().toISOString()} : f);
   lsSet(LS.asIs, ais);
   const updated = ais.find(f => f.id === id);
-  if (updated && window.zbodSupabase) window.zbodSupabase.sbSaveAsIsFunction(updated);
+  const change = syncChange(prev, updated);
+  if (updated && change && window.zbodSupabase) window.zbodSupabase.sbSaveAsIsFunction(updated, change);
 }
 function delAsIsFn(id) {
   lsSet(LS.asIs, getAsIs().filter(f => f.id !== id));
@@ -636,6 +663,11 @@ function planAsIsMutation(fns, spec) {
   const raised = [];
   const floorOn = spec.floor !== false;      // the workshop turns this off: a typed value is kept, over-allocation is shown, not undone
   // Applies `delta` to the chain starting at `startId`, stopping before `stopId`.
+  // People (managers + professionals) and cost (manager cost + professional cost) are each one pool:
+  // a parent's unallocated amount absorbs growth of either kind, and an ancestor never goes down
+  // because something under it grew. Each kind still stays at least what its children hold. Moved
+  // figures (absorb = false) arrive in full; nothing is created or lost when a kind is clamped at 0.
+  const POOLS = [['mgr', 'emp'], ['mc', 'pc']];
   function propagate(startId, delta, stopId, absorb = true) {
     let cur = startId;
     const carry = { ...delta };
@@ -643,37 +675,45 @@ function planAsIsMutation(fns, spec) {
     while (cur && W[cur] && cur !== stopId && !seen.has(cur)) {
       seen.add(cur);
       const P = W[cur];
-      ASIS_KEYS.forEach(k => {
-        const d = carry[k];
-        if (!d) return;
-        if (d > 0) {
-          const absorbed = absorb ? Math.min(d, unalloc[cur][k]) : 0;
-          unalloc[cur][k] -= absorbed;
-          P.t[k] = roundMoney(P.t[k] + (d - absorbed));
-          carry[k] = roundMoney(d - absorbed);
-        } else {
-          const next = Math.max(0, roundMoney(P.t[k] + d));
-          carry[k] = roundMoney(next - P.t[k]);
-          P.t[k] = next;
-        }
-      });
-      // People and cost each come in two kinds (managers/professionals, manager/professional cost). A
-      // leftover of one kind can be taken by growth of the other — "1 person unallocated" is cleared by
-      // giving 1 person to any sub-function — so the leftover is converted instead of the parent growing.
-      if (absorb) {
-        [['mgr', 'emp'], ['emp', 'mgr'], ['mc', 'pc'], ['pc', 'mc']].forEach(([k, other]) => {
-          if (carry[k] > 0 && unalloc[cur][other] > 0) {
-            const x = Math.min(carry[k], unalloc[cur][other]);
-            unalloc[cur][other] = roundMoney(unalloc[cur][other] - x);
-            P.t[other] = roundMoney(P.t[other] - x);
-            carry[other] = roundMoney((carry[other] || 0) - x);
-          }
-        });
-      }
-      // never below what its own children add up to
       const s = sumKids(cur);
       let didRaise = false;
-      if (floorOn) ASIS_KEYS.forEach(k => { if (P.t[k] < s[k]) { carry[k] = roundMoney(carry[k] + (s[k] - P.t[k])); P.t[k] = s[k]; didRaise = true; } });
+      POOLS.forEach(([a, b]) => {
+        const da = carry[a] || 0, db = carry[b] || 0;
+        if (!da && !db) return;
+        const A = P.t[a], B = P.t[b], old = roundMoney(A + B), kidsTotal = roundMoney(s[a] + s[b]);
+        const d = roundMoney(da + db);
+        let total = !absorb ? roundMoney(old + d) : (d >= 0 ? Math.max(old, kidsTotal) : roundMoney(old + d));
+        if (floorOn) total = Math.max(total, kidsTotal);
+        total = Math.max(0, total);
+        let na = roundMoney(A + da), nb = roundMoney(B + db);
+        if (floorOn) {
+          if (na < s[a]) { if (s[a] > 0) didRaise = true; na = s[a]; }       // a kind below its children is raised to cover them
+          if (nb < s[b]) { if (s[b] > 0) didRaise = true; nb = s[b]; }
+        }
+        na = Math.max(0, na); nb = Math.max(0, nb);
+        // bring the pool to its total, never below the children: a kind that grew first uses its OWN
+        // leftover (as before), only then the other kind's leftover is used (cross-kind)
+        const order = da >= db ? [a, b] : [b, a];
+        const dd = { [a]: da, [b]: db }, orig = { [a]: A, [b]: B };
+        const val = { [a]: na, [b]: nb };
+        let diff = roundMoney(val[a] + val[b] - total);
+        if (absorb) order.forEach(k => {
+          if (diff <= 0 || dd[k] <= 0) return;
+          const own = Math.max(0, roundMoney(orig[k] - (s[k] - dd[k])));          // its leftover before this change
+          const take = Math.min(diff, dd[k], own, Math.max(0, roundMoney(val[k] - (floorOn ? s[k] : 0))));
+          val[k] = roundMoney(val[k] - take); diff = roundMoney(diff - take);
+        });
+        order.forEach(k => {
+          if (diff <= 0) return;
+          const room = roundMoney(val[k] - (floorOn ? s[k] : 0));
+          const take = Math.min(diff, Math.max(0, room));
+          val[k] = roundMoney(val[k] - take); diff = roundMoney(diff - take);
+        });
+        if (diff < 0) val[order[0]] = roundMoney(val[order[0]] - diff);
+        // a decrease leaves every ancestor in full (A3/A5/A6); a local clamp at 0 is not passed up
+        if (d < 0) { carry[a] = da; carry[b] = db; } else { carry[a] = roundMoney(val[a] - A); carry[b] = roundMoney(val[b] - B); }
+        P.t[a] = val[a]; P.t[b] = val[b];
+      });
       if (didRaise && !raised.some(r => r.id === cur)) raised.push({ id: cur, name: P.name });
       cur = P.parent_id;
     }
@@ -683,7 +723,9 @@ function planAsIsMutation(fns, spec) {
   if (spec.kind === 'add') {
     const parentId = spec.parentId && W[spec.parentId] ? spec.parentId : null;
     targetTotals = { ...spec.totals };
+    W.__new__ = { id: '__new__', name: 'New', parent_id: parentId, t: { ...targetTotals } };   // the new child counts among its parent's children
     propagate(parentId, targetTotals, null);
+    delete W.__new__;
   } else {
     const T = W[spec.id];
     if (!T) return { updates: [], targetTotals: null, orphans: [], raised: [], changed: [] };
@@ -939,6 +981,12 @@ function wfCostsToPercents(wsId) {
   });
 }
 
+function wfNormalHCs(div, fns) {
+  const c = buildCascadedAllocations(fns, div.headcount_target || 0, div.budget_target || 0, state.phase3Values || {}, false);
+  const out = {};
+  fns.forEach(f => { const v = (c[f.id] || {}).proposedHC; out[f.id] = v === null || v === undefined ? null : v; });
+  return out;
+}
 function wfKeepFiguresUnder(ws, ids, parentOf, removedId) {
   const div = getDivs().find(d => d.id === ws.division_id);
   if (!div) return;
@@ -986,6 +1034,34 @@ function wfKeepFiguresUnder(ws, ids, parentOf, removedId) {
       if (Object.keys(keep).every(k => after[k] === keep[k])) {
         fns = trial;
         updFn(id, { cost_allocation_percent: pct, proposed_budget_manual: false });
+        return;
+      }
+    }
+  });
+  // Headcount the same way: people are split among siblings by largest remainder, so a % rounded to
+  // two decimals (2 of 7 = 28.57 %) can leave the moved function a hair short and hand a sibling's
+  // extra person to someone else (S 3.5 -> 4 became 3). The moved function and the sub-functions
+  // already under its new parent keep their people; the % used is the first one, from 2 decimals
+  // up, that the real cascade confirms. If none does, the one set above stays.
+  const keepHC = {};
+  const newParents = new Set(ids.map(id => parentOf(id) || ''));
+  fns.forEach(x => {
+    const b = before[x.id];
+    if (!b || b.proposed_hc === null || b.proposed_hc === undefined) return;
+    if (ids.includes(x.id) || newParents.has(x.parent_id || '')) keepHC[x.id] = b.proposed_hc;
+  });
+  ids.forEach(id => {
+    if (keepHC[id] === undefined) return;
+    const pid = parentOf(id);
+    const pool = pid ? wfNormalHCs(div, fns)[pid] : (div.headcount_target || 0);
+    if (!(pool > 0)) return;
+    if (Object.keys(keepHC).every(k => wfNormalHCs(div, fns)[k] === keepHC[k])) return;
+    for (const pct of wfCostPctCandidates(keepHC[id], pool)) {
+      const trial = fns.map(x => (x.id === id ? { ...x, hc_allocation_percent: pct } : x));
+      const after = wfNormalHCs(div, trial);
+      if (Object.keys(keepHC).every(k => after[k] === keepHC[k])) {
+        fns = trial;
+        updFn(id, { hc_allocation_percent: pct });
         return;
       }
     }
@@ -1103,8 +1179,20 @@ function asIsCurrentTotals(fns) {
 // A workshop splits the targets, so it cannot start before both are set.
 function divTargetsSet(div) { return !!div && Number(div.headcount_target) > 0 && Number(div.budget_target) > 0; }
 
+// The AS-IS a workshop is compared with. A completed workshop (and an AS-IS Baseline workshop from
+// the moment it is copied) keeps the copy taken then, so a later upload or edit of the structure's
+// AS-IS cannot change an old programme's AS-IS side, its savings or its reports (audit). Workshops
+// without a copy (drafts, or completed before copies were kept) follow the live AS-IS as before.
 function getWorkshopAsIs(ws) {
+  let snap = ws && ws.as_is_snapshot;
+  if (typeof snap === 'string') { try { snap = JSON.parse(snap); } catch (_) { snap = null; } }
+  if (Array.isArray(snap) && (ws.status === 'completed' || ws.source === 'as_is_baseline')) return snap;
   return getAsIs().filter(f => f.division_id === ws.division_id);
+}
+const AS_IS_SNAPSHOT_FIELDS = ['id', 'division_id', 'function_name', 'parent_id', 'manager_count', 'current_employee_count', 'current_function_hc', 'managers_cost', 'professionals_cost', 'current_budget', 'created_at'];
+function asIsSnapshotOf(divisionId) {
+  return getAsIs().filter(f => f.division_id === divisionId)
+    .map(f => Object.fromEntries(AS_IS_SNAPSHOT_FIELDS.map(k => [k, f[k] === undefined ? null : f[k]])));
 }
 
 function describeAsIsChanges(changed) {
@@ -1162,14 +1250,29 @@ function importAsIsFunctionsFromWorkbook(divisionId, arrayBuffer) {
   // reported instead of being stored silently.
   const notes = [];
   const note = (name, msg) => { notes.push(`${name}: ${msg}`); };
+  // A number cell is used as it is (Excel can leave a residue such as 1.1368E-13). A text cell is
+  // read only when it has one clear meaning: digits with an optional decimal point, comma thousands
+  // (85,000.50), spaces (85 000) or "AZN". Anything else ("85000,50", "85.000") could be two different
+  // amounts, so it is set to 0 and reported instead of being stored as a guess.
   const num = (v, name, label, whole) => {
-    const raw = String(v == null ? '' : v).trim();
-    if (raw === '') return 0;
-    let n = parseFloat(raw.replace(/[^0-9.\-]/g, ''));
-    if (isNaN(n)) { note(name, `${label} "${raw}" is not a number, set to 0`); return 0; }
+    let n;
+    if (typeof v === 'number') n = v;
+    else {
+      const shown = String(v == null ? '' : v).trim();
+      const raw = shown.replace(/[\s  ]/g, '').replace(/(azn|₼)$/i, '');
+      if (raw === '') return 0;
+      let t = null;
+      if (/^-?\d+(\.\d+)?(e[-+]?\d+)?$/i.test(raw) && !/^-?\d{1,3}(\.\d{3})+$/.test(raw)) t = raw;
+      else if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(raw)) t = raw.replace(/,/g, '');
+      if (t === null) { note(name, `${label} "${shown}" could not be read as one amount, set to 0 (write digits only, e.g. 85000.50)`); return 0; }
+      n = Number(t);
+    }
+    if (!isFinite(n)) { note(name, `${label} "${v}" is not a number, set to 0`); return 0; }
     if (n < 0) { note(name, `${label} ${n} is negative, set to 0`); return 0; }
-    if (whole && !Number.isInteger(n)) { const r = Math.round(n); note(name, `${label} ${n} rounded to ${r}`); n = r; }
-    return whole ? n : roundMoney(n);
+    const r = whole ? Math.round(n) : roundMoney(n);
+    // a residue far below one qepik / one person is dropped silently; a real fraction is reported
+    if (Math.abs(r - n) > 1e-6) note(name, `${label} ${n} rounded to ${r}`);
+    return r;
   };
   const parsedRows = [];
   const rootNames = [];
@@ -1275,27 +1378,89 @@ function applyAsIsImportRows(divisionId, parsedRows) {
   // file without a ROOT row, the unknown parent name most rows report into. Only other unknown
   // parent names (typos) are reported.
   const rootNames = new Set([divName, ...(parsedRows.rootNames || [])].filter(Boolean));
-  if (!(parsedRows.rootNames || []).length) {
+  const parentKey = r => (r.parent || '').toLowerCase();
+  // The root is the name the top functions report into. Those functions have sub-functions of their
+  // own, while a misspelt parent name is usually used by a few leaf rows -- so the unknown name whose
+  // rows are parents wins, and only then the one used most. (Counting rows alone picked a typo used
+  // by 5 leaves over the real root used by 4 top functions.)
+  if (!(parsedRows.rootNames || []).length && !parsedRows.some(r => rootNames.has(parentKey(r)))) {
+    const isParent = new Set(parsedRows.map(parentKey).filter(Boolean));
     const unknown = {};
     parsedRows.forEach(r => {
-      const k = (r.parent || '').toLowerCase();
-      if (k && !nameToId[k] && !rootNames.has(k)) unknown[k] = (unknown[k] || 0) + 1;
+      const k = parentKey(r);
+      if (!k || nameToId[k] || rootNames.has(k)) return;
+      const u = unknown[k] = unknown[k] || { parents: 0, rows: 0 };
+      u.rows++; if (isParent.has(r.name.toLowerCase())) u.parents++;
     });
-    const top = Object.keys(unknown).sort((a, b) => unknown[b] - unknown[a])[0];
+    const top = Object.keys(unknown).sort((a, b) => unknown[b].parents - unknown[a].parents || unknown[b].rows - unknown[a].rows)[0];
     if (top) rootNames.add(top);
   }
+  // A name that is both the ROOT row and a function title cannot tell which rows report to which.
+  [...rootNames].filter(k => nameToId[k]).forEach(k => {
+    const t = parsedRows.find(r => r.name.toLowerCase() === k).name;
+    notes.push(`"${t}" is both the ROOT name and a function title: rows with this parent were put under the function. Leave Parent Function blank for top-level functions`);
+  });
+  // Closest title for a parent name that is not in the file (one or two letters different).
+  const dist = (a, b) => {
+    if (Math.abs(a.length - b.length) > 2) return 9;
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[b.length];
+  };
+  const closest = k => { const hit = parsedRows.find(r => k.length > 3 && dist(k, r.name.toLowerCase()) <= 2); return hit ? hit.name : ''; };
+  const lostByParent = {};
   parsedRows.forEach(r => {
     if (!r.parent) return;
     const selfId = r._id;
     const parentId = nameToId[r.parent.toLowerCase()];
     if (!parentId) {
-      if (!rootNames.has(r.parent.toLowerCase())) notes.push(`${r.name}: parent "${r.parent}" was not found in the file, placed at the top level`);
+      if (!rootNames.has(r.parent.toLowerCase())) (lostByParent[r.parent] = lostByParent[r.parent] || []).push(r.name);
       return;
     }
     if (parentId === selfId) { notes.push(`${r.name}: a function cannot be its own parent, placed at the top level`); return; }
     if (wouldLoop(selfId, parentId)) { notes.push(`${r.name}: putting it under "${r.parent}" would create a loop, placed at the top level`); return; }
     parentOf[selfId] = parentId;
     updAsIsFn(selfId, { parent_id: parentId });
+  });
+  Object.keys(lostByParent).forEach(p => {
+    const near = closest(p.toLowerCase());
+    notes.push(`parent "${p}" was not found in the file${near ? ` (did you mean "${near}"?)` : ''}, placed at the top level: ${lostByParent[p].join(', ')}`);
+  });
+  // Rule A4: a parent's figure includes its sub-functions. A parent row below the sum of its
+  // sub-functions (a subtotal not updated, or a row holding only the head) is raised to that sum,
+  // deepest parents first, and every raise is reported -- as when a parent is typed too low.
+  // People and cost are each one pool (rule A2 lets a parent's managers/professionals mix differ
+  // from its sub-functions'), so only a pool total below the sub-functions' total is raised, by the
+  // missing amount, on the kind that is short.
+  const kidsOf = {};
+  parsedRows.forEach(r => { const p = parentOf[r._id]; if (p) (kidsOf[p] = kidsOf[p] || []).push(r._id); });
+  const fig = {};
+  parsedRows.forEach(r => { fig[r._id] = { r, mgr: r.mgr, prof: r.prof, mgrCost: roundMoney(r.mgrCost), profCost: roundMoney(r.profCost) }; });
+  const depth = id => { let d = 0, c = id; while (parentOf[c] && d < 1000) { c = parentOf[c]; d++; } return d; };
+  const LABEL = { mgr: 'Managers', prof: 'Professionals', mgrCost: 'Managers Cost', profCost: 'Professionals Cost' };
+  Object.keys(kidsOf).sort((a, b) => depth(b) - depth(a)).forEach(pid => {
+    const P = fig[pid]; const raised = [];
+    const sum = k => roundMoney(kidsOf[pid].reduce((t, c) => t + fig[c][k], 0));
+    [['mgr', 'prof'], ['mgrCost', 'profCost']].forEach(([a, b]) => {
+      const S = { [a]: sum(a), [b]: sum(b) };
+      let missing = roundMoney(S[a] + S[b] - P[a] - P[b]);
+      [a, b].forEach(k => {
+        if (missing <= 0 || P[k] >= S[k]) return;
+        const add = Math.min(missing, roundMoney(S[k] - P[k]));
+        raised.push(`${LABEL[k]} ${P[k]} to ${roundMoney(P[k] + add)}`);
+        P[k] = roundMoney(P[k] + add); missing = roundMoney(missing - add);
+      });
+    });
+    if (!raised.length) return;
+    notes.push(`${P.r.name}: less than its sub-functions, raised (${raised.join(', ')})`);
+    updAsIsFn(pid, {
+      manager_count: P.mgr, current_employee_count: P.prof, current_function_hc: P.mgr + P.prof,
+      managers_cost: P.mgrCost, professionals_cost: P.profCost, current_budget: roundMoney(P.mgrCost + P.profCost),
+    });
   });
 
   renderWorkspace();
@@ -2314,7 +2479,7 @@ function copyAsIsBaselineToWorkshop(divisionId) {
   // Marks this workshop as an AS-IS Baseline analysis rather than a TO-BE redesign — read by the
   // Compare Dashboard (buildDashboardHTML/renderDashboardCharts) and the Excel export to show
   // AS-IS vs Target instead of AS-IS vs TO-BE/Proposed.
-  updWs(ws.id, { source: 'as_is_baseline' });
+  updWs(ws.id, { source: 'as_is_baseline', as_is_snapshot: asIsSnapshotOf(ws.division_id) });
   ws.source = 'as_is_baseline';
 
   const asIsFns = getAsIs().filter(f => f.division_id === divisionId);
@@ -2349,6 +2514,12 @@ function copyAsIsBaselineToWorkshop(divisionId) {
   asIsFns.forEach(f => { if (!orderedVisited.has(f.id)) { orderedVisited.add(f.id); ordered.push(f); } });
 
   const idMap = {};
+  // Frozen at copy time, like the As-Is columns: how much of each function the AS-IS data did not
+  // give to any sub-function -- 0 for every function without such a gap, so that moving functions
+  // in or out later can never make the red "Unallocated from AS-IS data" note appear (rule B2).
+  // (Stored in target_headcount / target_budget, columns the workshop never used for anything else.)
+  const unallocatedAtCopy = {};
+  asIsUnallocatedParents(asIsFns).forEach(u => { unallocatedAtCopy[u.id] = u; });
   ordered.forEach((asIsFn, i) => {
     const pid = resolveParent(asIsFn);
     const newFn = addFn(ws.id, i + 1);
@@ -2372,6 +2543,8 @@ function copyAsIsBaselineToWorkshop(divisionId) {
       // Same idea, for the Dashboard's per-function AS-IS vs Proposed comparison table.
       as_is_managers_cost: asIsFn.managers_cost || null,
       as_is_professionals_cost: asIsFn.professionals_cost || null,
+      target_headcount: (unallocatedAtCopy[asIsFn.id] || {}).hc || 0,
+      target_budget: (unallocatedAtCopy[asIsFn.id] || {}).cost || 0,
     });
   });
 
@@ -2381,14 +2554,6 @@ function copyAsIsBaselineToWorkshop(divisionId) {
   // below, since the percentage-driven cascade (buildCascadedAllocations) needs a starting
   // percentage on every function to derive Proposed HC / Proposed Cost from.
   const newFns = getFns().filter(f => f.workshop_id === ws.id);
-  // Frozen at copy time, like the As-Is columns: how much of each parent the AS-IS data did not give
-  // to any sub-function. The red "Unallocated from AS-IS data" note on that parent is measured
-  // against this, so moving functions in or out later cannot make the note appear or vanish wrongly.
-  // (Stored in target_headcount / target_budget, columns the workshop never used for anything else.)
-  asIsUnallocatedParents(asIsFns).forEach(u => {
-    const wid = idMap[u.id];
-    if (wid) updFn(wid, { target_headcount: u.hc || null, target_budget: u.cost || null });
-  });
   const baselinePercents = computeAsIsBaselinePercents(newFns, div.headcount_target || 0, div.budget_target || 0);
   newFns.forEach(f => {
     const p = baselinePercents[f.id] || {};
@@ -2463,6 +2628,27 @@ function freshWorkshopFns(ws) {
       total_hc: v.parentHC ?? f.total_hc, total_budget: v.parentBudget ?? f.total_budget,
       hc_allocation_percent: v.hcAllocationPercent ?? f.hc_allocation_percent, cost_allocation_percent: v.costAllocationPercent ?? f.cost_allocation_percent };
   });
+}
+
+// New Workshop, Phase 2: the managers (and, the same way, the professionals) of a parent's sub-functions
+// are carved out of the parent's own numbers, so they can never add up to more than it has. A parent's
+// empty box means "not entered yet": no limit. 0 is a real limit.
+const WF_COUNT_NOUN = { manager_count: 'manager', professional_count: 'professional' };
+function wfCountOf(f, field) {
+  const raw = (state.phase3Values || {})[f.id];
+  const v = raw && raw[field] !== undefined ? raw[field] : f[field];
+  return v === null || v === undefined || v === '' ? null : (Number(v) || 0);
+}
+// For function f: its parent, the parent's number, and how many of them f can still take
+// (what the parent has minus what f's brothers and sisters already hold). null = no limit applies.
+function countLeftFor(f, all, field) {
+  const parent = f.parent_id ? all.find(x => x.id === f.parent_id && x.workshop_id === f.workshop_id) : null;
+  if (!parent) return null;
+  const limit = wfCountOf(parent, field);
+  if (limit === null) return null;
+  const others = all.filter(x => x.parent_id === parent.id && x.id !== f.id && x.workshop_id === f.workshop_id)
+    .reduce((t, x) => t + (wfCountOf(x, field) || 0), 0);
+  return { parent, limit, left: limit - others };
 }
 
 function calculateWorkshopAllocationTotals(workshopId, phase3Values) {
@@ -2549,7 +2735,9 @@ function saveCompletedWorkshop(workshopId) {
   const divNow = wsNow && getDivs().find(d => d.id === wsNow.division_id);
   updWs(workshopId, { status: 'completed', completed_at: now, phase: 3,
     target_headcount_snapshot: divNow ? (divNow.headcount_target || 0) : null,
-    target_budget_snapshot: divNow ? (divNow.budget_target || 0) : null });
+    target_budget_snapshot: divNow ? (divNow.budget_target || 0) : null,
+    // the AS-IS it was compared with (a baseline workshop keeps the one taken at copy time)
+    ...(wsNow && wsNow.as_is_snapshot ? {} : { as_is_snapshot: asIsSnapshotOf(wsNow ? wsNow.division_id : null) }) });
 }
 
 function loadDashboardData(workshopId) {
@@ -3961,7 +4149,7 @@ async function renderWorkspace() {
       const color = dispPhase === 1 ? 'rgba(146,64,14,0.1);color:#92400e' : 'rgba(46,100,44,0.1);color:#2E642C';
       // The trash button is always visible: on a tablet there is no right-click for the context menu.
       const delBtn = readOnly ? '' : `<button class="ws-del-btn" onclick="event.stopPropagation();app.confirmDeleteWorkshop('${escHtml(w.id)}')" title="Delete workshop" aria-label="Delete workshop">${ICONS.trash}</button>`;
-      workshopHtml += `<div class="zbod-card p-4 flex items-center justify-between" style="cursor:pointer;" onclick="app.resumeWorkshop('${escHtml(w.id)}',${w.phase})" oncontextmenu="app.openWorkshopContextMenu(event,'${escHtml(w.id)}')"><div class="flex items-center gap-3"><div style="width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:${color};">${dispPhase}</div><div><p style="font-size:14px;font-weight:600;color:#111827;">Workshop in Progress</p><p style="font-size:12px;color:#6b7280;">Phase ${dispPhase} of 2</p></div></div><div class="flex items-center">${delBtn}${ICONS.chevronRight}</div></div>`;
+      workshopHtml += `<div class="zbod-card p-4 flex items-center justify-between" style="cursor:pointer;" onclick="app.resumeWorkshop('${escHtml(w.id)}',${w.phase})" oncontextmenu="app.openWorkshopContextMenu(event,'${escHtml(w.id)}')"><div class="flex items-center gap-3"><div style="width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:${color};">${dispPhase}</div><div><p style="font-size:14px;font-weight:600;color:#111827;">Workshop in Progress</p><p style="font-size:12px;color:#6b7280;">Phase ${dispPhase} of 2</p>${w.based_on_workshop_id ? `<p style="font-size:11px;color:#6b7280;">Version of Workshop #${escHtml(String(w.based_on_workshop_id).slice(0, 8))}</p>` : ''}</div></div><div class="flex items-center">${delBtn}${ICONS.chevronRight}</div></div>`;
     });
     workshopHtml += '</div>';
   } else {
@@ -4567,7 +4755,11 @@ function renderPhase3() {
   // the one seeded at copy time before a parent changed). No figure is touched.
   if (isAsIs) {
     if (!state._wfFresh) state._wfFresh = {};
-    if (!state._wfFresh[ws.id]) { state._wfFresh[ws.id] = true; wfMaterialize(ws.id); wfRefreshPercents(ws.id); }
+    // ...and again whenever a structure target has changed since (rule B5: the figures stay, the %
+    // shown follows the new target at once, not only after the next sign-in).
+    const targetsKey = `${div.headcount_target || 0}|${div.budget_target || 0}`;
+    if (state._wfFresh[ws.id] === undefined) wfMaterialize(ws.id);
+    if (state._wfFresh[ws.id] !== targetsKey) { state._wfFresh[ws.id] = targetsKey; wfRefreshPercents(ws.id); }
   }
   // The Allocation Summary card (and its help icon) is about to be destroyed and rebuilt — close
   // any open popover now, before its anchor becomes a detached, stale-positioned node.
@@ -4652,6 +4844,16 @@ function renderPhase3() {
       const workplaceBudget = cascaded.parentBudget !== undefined ? cascaded.parentBudget : (div.budget_target || 0);
       const mgrCount = raw.manager_count !== undefined ? raw.manager_count : f.manager_count;
       const profCount = raw.professional_count !== undefined ? raw.professional_count : f.professional_count;
+      // New Workshop: how many of the parent's managers / professionals this function can still take.
+      // With none left (and none held) the box cannot be typed in.
+      const roomFor = (field, held) => {
+        const room = isAsIs ? null : countLeftFor(f, fns, field);
+        const locked = !!room && room.left <= 0 && !(Number(held) > 0);
+        const hint = room ? ` <span style="text-transform:none;letter-spacing:normal;font-weight:500;color:#9ca3af;">(${locked ? `none left in ${escHtml(room.parent.proposed_function_name || 'parent')}` : `max ${Math.max(0, room.left)}`})</span>` : '';
+        const attrs = locked ? ` disabled title="All ${WF_COUNT_NOUN[field]}s of ${escHtml(room.parent.proposed_function_name || 'the parent')} are already allocated" style="background:#f3f4f6;cursor:not-allowed;"` : '';
+        return { hint, attrs };
+      };
+      const mgrRoom = roomFor('manager_count', mgrCount), profRoom = roomFor('professional_count', profCount);
       const proposedHC = cascaded.proposedHC !== undefined ? cascaded.proposedHC : (f.proposed_hc || null);
       const proposedBudget = cascaded.proposedBudget !== undefined ? cascaded.proposedBudget : (f.proposed_budget || null);
       // HC Allocation % / Cost Allocation % are directly editable for every workshop (see
@@ -4730,8 +4932,8 @@ function renderPhase3() {
         </div>`}
         <div class="flex items-center gap-2" style="margin-top:16px;"><span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;">People Allocation</span>${renderFieldHelp('p3-people-allocation-' + f.id, PEOPLE_ALLOCATION_HELP_QA)}</div>
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mt-4">
-          <div><label style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;display:block;">Proposed Managers${asIsMgrHint}</label><input type="number" class="zbod-input w-full" value="${mgrCount || ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','manager_count',this.value)" placeholder="0" onwheel="return false;"></div>
-          <div><label style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;display:block;">Proposed Professionals${asIsProfHint}</label><input type="number" class="zbod-input w-full" value="${profCount || ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','professional_count',this.value)" placeholder="0" onwheel="return false;"></div>
+          <div><label style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;display:block;">Proposed Managers${asIsMgrHint}${mgrRoom.hint}</label><input type="number" class="zbod-input w-full" value="${mgrCount || ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','manager_count',this.value)" placeholder="0" onwheel="return false;"${mgrRoom.attrs}></div>
+          <div><label style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;margin-bottom:6px;display:block;">Proposed Professionals${asIsProfHint}${profRoom.hint}</label><input type="number" class="zbod-input w-full" value="${profCount || ''}" onchange="app.updatePhase3Value('${escHtml(f.id)}','professional_count',this.value)" placeholder="0" onwheel="return false;"${profRoom.attrs}></div>
           <div style="padding:12px;border-radius:10px;background:rgba(15,60,118,0.04);border:1px solid rgba(15,60,118,0.1);">
             <span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:#6b7280;">HC Allocation Check</span>
             <span style="font-size:18px;font-weight:700;color:#111827;display:block;margin-top:4px;">${actualHC} / ${proposedHC !== null ? proposedHC : '-'}</span>
@@ -4772,7 +4974,9 @@ function renderPhase3() {
         const snap = f => ({ hc: (parseInt(f.as_is_manager_count) || 0) + (parseInt(f.as_is_professional_count) || 0), cost: (parseFloat(f.as_is_managers_cost) || 0) + (parseFloat(f.as_is_professionals_cost) || 0) });
         // The amount frozen at copy time; workshops copied before it existed fall back to the As-Is
         // copies of the parent and its current children.
-        const frozen = parentFn.target_headcount != null || parentFn.target_budget != null;
+        // A workshop that froze any amount froze them all (a parent without a value had none).
+        const frozen = parentFn.target_headcount != null || parentFn.target_budget != null
+          || fns.some(x => x.target_headcount != null || x.target_budget != null);
         const ps = snap(parentFn);
         const cs = children.reduce((a, c) => { const t = snap(c); return { hc: a.hc + t.hc, cost: a.cost + t.cost }; }, { hc: 0, cost: 0 });
         const fromAsIsHC = frozen ? (Number(parentFn.target_headcount) || 0) : ps.hc - cs.hc;
@@ -4901,9 +5105,10 @@ function p3ScopeData(name, hcPct, costPct, hcUsed, hcTarget, costUsed, costTarge
 }
 
 // The sticky bar carries the scale of the function group the reader is currently scrolling
-// through, named so it can't be mistaken for another. The division-level summary is deliberately
-// NOT mirrored here — it is read in place at the top of the page, so scrolling past it leaves the
-// bar hidden until the first function group begins.
+// through, named so it can't be mistaken for another. Inside a parent's sub-function section that is
+// the parent's scale; among the top-level functions (those reporting straight to the structure) it is
+// the structure's own scale. The structure's summary card at the top of the page is read in place, so
+// while it is on screen the bar stays hidden; once it has scrolled past, the bar takes over.
 function setupPhase3StickyCompact() {
   // Phase 3 re-renders on every keystroke; keeping the visible state avoids the bar flickering
   // away and back while the reader is mid-scroll.
@@ -4912,7 +5117,8 @@ function setupPhase3StickyCompact() {
 
   const groups = [...document.querySelectorAll('#phase3-content .p3-child-tracker[data-scope-name]')]
     .map(el => ({ el, section: el.closest('.p3-children-section, .p3-children-nested') || el }));
-  if (!groups.length) return;
+  const rootTracker = document.querySelector('#phase3-content #p3-tracker-main[data-scope-name]');
+  if (!groups.length && !rootTracker) return;
 
   let bar = document.getElementById('p3-compact-sticky');
   if (!bar) {
@@ -4962,7 +5168,6 @@ function setupPhase3StickyCompact() {
   };
 
   // Document order puts nested groups last, so the innermost group the reader is inside wins.
-  // Outside every group — the division level — there is nothing to show and the bar retracts.
   const pick = () => {
     const pageEl = document.getElementById('page-phase3');
     if (!pageEl || pageEl.classList.contains('hidden')) return;
@@ -4972,6 +5177,9 @@ function setupPhase3StickyCompact() {
       const r = g.section.getBoundingClientRect();
       if (r.top <= line && r.bottom > line) active = g.el;
     });
+    // Outside every parent's section the reader is among the top-level functions: show the
+    // structure's scale, but only after its summary card has scrolled out of view.
+    if (!active && rootTracker && rootTracker.getBoundingClientRect().bottom <= line) active = rootTracker;
     if (!active) { bar.classList.remove('p3-compact-sticky--visible'); return; }
     paint(active);
     bar.classList.add('p3-compact-sticky--visible');
@@ -5317,8 +5525,10 @@ function buildDashboardHTML(ws, div, fns, asIsFns, chartPrefix = '') {
   // every other row honestly shows "–" rather than implying a target that doesn't exist.
   {
     const proposedLabel = isAsIs ? 'Proposed' : 'TO-BE';
-    const relevantHC = isAsIs ? totalAsIsHC : totalToBeHC;
-    const relevantBudget = isAsIs ? totalAsIsBudget : totalToBeBudget;
+    // The status judges the proposal shown in this table (an AS-IS Baseline workshop's own figures
+    // too), not the AS-IS column: a baseline workshop cut to 48 vs a target of 48 is within target.
+    const relevantHC = totalToBeHC;
+    const relevantBudget = totalToBeBudget;
     const asIsMgrs = rootAsIsFns.reduce((s, f) => s + (f.manager_count || 0), 0);
     const asIsProfs = rootAsIsFns.reduce((s, f) => s + (f.current_employee_count || 0), 0);
     const toBeMgrs = rootFns.reduce((s, f) => s + (f.manager_count || 0), 0);
@@ -5717,6 +5927,7 @@ function renderHistory() {
             ${isSubmitted ? `<span class="hr-status-badge hr-status-badge--submitted" style="font-size:10px;padding:3px 10px;">${ICONS.checkCircle} Submitted for HR Review</span>` : ''}
           </div>
           <p style="font-size:13px;color:#6b7280;">${dt.toLocaleDateString()} &mdash; ${dt.toLocaleTimeString()}</p>
+          ${w.based_on_workshop_id ? `<p style="font-size:11px;color:#6b7280;margin-top:2px;">Version of Workshop #${escHtml(String(w.based_on_workshop_id).slice(0, 8))}</p>` : ''}
           <p style="font-size:11px;color:#16A34A;margin-top:4px;">${fns.length} functions | HC: ${formatNumber(totalHC)} | Budget: ${formatNumber(totalBudget)} AZN</p>
         </div>
       </div>
@@ -5743,7 +5954,7 @@ function renderHistoryReview() {
     <div class="flex items-center gap-4 max-w-screen-2xl mx-auto">
       <button class="zbod-btn-secondary" style="padding:10px 14px;" onclick="app.goToHistory()">${ICONS.arrowLeft}</button>
       <div class="flex-1 flex items-center gap-3"><div style="width:32px;height:32px;border-radius:8px;background:rgba(46,100,44,0.1);display:flex;align-items:center;justify-content:center;">${ICONS.history}</div><h1 style="font-family:'Montserrat',sans-serif;font-weight:700;font-size:18px;color:#111827;">Workshop from ${new Date(ws.completed_at || ws.created_at).toLocaleDateString()} ${new Date(ws.completed_at || ws.created_at).toLocaleTimeString()}</h1>${isSubmitted ? `<span class="hr-status-badge hr-status-badge--submitted">${ICONS.checkCircle} Submitted for HR Review</span>` : ''}</div>
-      ${isSubmitted ? `<button class="zbod-btn-primary" style="padding:8px 16px;font-size:12px;" onclick="app.goToHRReview()">${ICONS.eye} View HR Submission</button>` : ''}
+      ${ws.source !== 'as_is_baseline' && canWriteDivision(getDivs().find(d => d.id === ws.division_id)) ? `<button class="zbod-btn-secondary" style="padding:8px 16px;font-size:12px;" onclick="app.editWorkshopAsNewVersion('${escHtml(ws.id)}')">${ICONS.copy} Edit as new version</button>` : ''}${isSubmitted ? `<button class="zbod-btn-primary" style="padding:8px 16px;font-size:12px;" onclick="app.goToHRReview()">${ICONS.eye} View HR Submission</button>` : ''}
     </div>`;
 
   // Destroy old charts before injecting HTML to prevent Chart.js canvas conflicts
@@ -5940,7 +6151,7 @@ const fieldHelpRegistry = {};
 
 function renderFieldHelp(id, qaPairs) {
   fieldHelpRegistry[id] = qaPairs;
-  return `<button type="button" class="zbod-help-icon-btn" onclick="event.stopPropagation();app.toggleFieldHelp('${escHtml(id)}', this)" aria-label="Help" aria-haspopup="true" aria-expanded="false" aria-describedby="field-help-popover">?</button>`;
+  return `<button type="button" class="zbod-help-icon-btn" tabindex="-1" onclick="event.stopPropagation();app.toggleFieldHelp('${escHtml(id)}', this)" aria-label="Help" aria-haspopup="true" aria-expanded="false" aria-describedby="field-help-popover">?</button>`;
 }
 
 function closeAllFieldHelpPopovers() {
@@ -7394,6 +7605,58 @@ const app = {
 
   hideWorkshopDialog() { document.getElementById('workshop-dialog').classList.add('hidden'); },
 
+  // History: a completed (normal) workshop is never reopened. "Edit as new version" starts a new
+  // draft that is an exact copy of it -- every Phase 1 answer and every Phase 2 % and figure -- so
+  // work continues where it ended. Completing the draft adds a separate workshop to History; the
+  // original stays exactly as it was. AS-IS Baseline workshops are not offered this.
+  editWorkshopAsNewVersion(id) {
+    const src = getWs().find(w => w.id === id);
+    const div = src && getDivs().find(d => d.id === src.division_id);
+    if (!src || !div || src.status !== 'completed' || src.source === 'as_is_baseline') return;
+    if (!canWriteDivision(div)) { toast('You do not have access to this workshop', { type: 'error' }); return; }
+    if (!divTargetsSet(div)) {
+      toast('Workshop not started', { type: 'error', description: 'Set Headcount Target and Budget Target first.' });
+      return;
+    }
+    // One draft at a time: the open one is resumed or deleted first.
+    const draft = getWs().find(w => w.division_id === div.id && w.status === 'draft');
+    if (draft) {
+      state.selectedDivisionId = div.id;
+      document.getElementById('workshop-dialog-title').innerText = 'Workshop In Progress';
+      document.getElementById('workshop-dialog-body').innerText = 'You have a draft workshop. Resume it, or delete it on the structure page, before editing this workshop as a new version.';
+      document.getElementById('workshop-dialog-buttons').innerHTML =
+        `<button onclick="app.resumeWorkshop('${escHtml(draft.id)}',${draft.phase})" class="zbod-btn-primary">${ICONS.play} Resume</button>
+         <button onclick="app.hideWorkshopDialog()" class="zbod-btn-secondary">Cancel</button>`;
+      document.getElementById('workshop-dialog').classList.remove('hidden');
+      return;
+    }
+    const ws = addWs(div.id);
+    updWs(ws.id, { based_on_workshop_id: src.id });
+    // Every function as it is, in the same order; parents point to the copies.
+    const SKIP = new Set(['id', 'workshop_id', 'parent_id', 'created_at', 'updated_at']);
+    const srcFns = getFns().filter(f => f.workshop_id === src.id).sort((a, b) => a.function_number - b.function_number);
+    const idMap = {};
+    srcFns.forEach(f => { idMap[f.id] = addFn(ws.id, f.function_number).id; });
+    srcFns.forEach(f => {
+      const fields = {};
+      Object.keys(f).forEach(k => { if (!SKIP.has(k)) fields[k] = f[k]; });
+      fields.parent_id = f.parent_id && idMap[f.parent_id] ? idMap[f.parent_id] : '';
+      updFn(idMap[f.id], fields);
+    });
+    state.selectedDivisionId = div.id;
+    state.selectedWorkshopId = ws.id;
+    state.editingValues = {};
+    state.phase3Values = {};
+    state.p3ExpandedChildren = new Set();
+    this.hideWorkshopDialog();
+    // The % are the workshop's own; with the same targets every figure is the same to the qapik.
+    const tHC = src.target_headcount_snapshot, tB = src.target_budget_snapshot;
+    const changed = tHC != null && tB != null && (Number(tHC) !== Number(div.headcount_target || 0) || Number(tB) !== Number(div.budget_target || 0));
+    showPage('phase1'); renderPhase1();
+    toast('New version started', { description: `A copy of Workshop #${src.id.slice(0, 8)}. Completing it adds a new workshop to History; the original does not change.`
+      + (changed ? ` The structure targets have changed since (${formatNumber(tHC)} / ${formatNumber(tB)} AZN then, ${formatNumber(div.headcount_target)} / ${formatNumber(div.budget_target)} AZN now): the % are kept, Proposed HC and Cost follow the current targets.` : '') });
+  },
+
   startNewWorkshop() {
     if (!divTargetsSet(getDivs().find(d => d.id === state.selectedDivisionId))) {
       this.hideWorkshopDialog();
@@ -7441,11 +7704,24 @@ const app = {
     }
   },
 
-  resumeWorkshop(id, phase) {
+  async resumeWorkshop(id, phase) {
     const w = getWs().find(x => x.id === id);
     const d = w && getDivs().find(x => x.id === w.division_id);
     if (!w || !d || !canAccessDivision(d)) { toast('You do not have access to this workshop', { type: 'error' }); return; }
     if (w.status === 'completed') { toast('This workshop is already completed', { type: 'error' }); return; }
+    // This page may be older than the cloud: the workshop can have been completed (or deleted) on
+    // another computer. Resuming it from here would turn it back into a draft, so ask the cloud first.
+    const sb = window.zbodSupabase;
+    if (sb && sb.supabaseAvailable && sb.sbFetchRow) {
+      const cur = await sb.sbFetchRow('workshops', id);
+      if (cur && cur.status === 'completed') {
+        lsSet(LS.workshops, getWs().map(x => x.id === id ? { ...x, ...cur } : x));
+        toast('This workshop was completed on another computer', { type: 'error', description: 'It cannot be resumed. It is now shown as completed.' });
+        this.hideWorkshopDialog();
+        if (state.currentPage === 'workspace') renderWorkspace();
+        return;
+      }
+    }
     state.selectedWorkshopId = id;
     state.editingValues = {};
     state.phase3Values = {};
@@ -7754,6 +8030,30 @@ const app = {
     else if (field === 'manager_count' || field === 'professional_count') parsed = Math.max(0, parseInt(rawText, 10) || 0);
     else if (field === 'proposed_budget') parsed = Math.max(0, parseMoney(rawText));
     else { const n = parseFloat(rawText); if (!isFinite(n)) { renderPhase3(); return; } parsed = Math.max(0, n); }
+    // Managers and professionals: the sub-functions of a parent can never hold more of either than the
+    // parent has. A number that would break it is not saved (the box goes back to what it was) and the
+    // reason is shown. A value that lowers an excess already there (older data) is still accepted.
+    if (WF_COUNT_NOUN[field] && parsed !== null && own) {
+      const noun = WF_COUNT_NOUN[field];
+      const all = getFns().filter(x => x.workshop_id === own.workshop_id);
+      const was = wfCountOf(own, field);
+      const room = countLeftFor(own, all, field);
+      const plural = n => `${noun}${Number(n) === 1 ? '' : 's'}`;
+      if (room && parsed > room.left && parsed > (was || 0)) {
+        const pn = room.parent.proposed_function_name || 'the parent';
+        toast('Not saved', { type: 'error', description: room.left <= 0
+          ? `No ${noun}s left in ${pn}: all ${formatNumber(room.limit)} are already allocated to its sub-functions.`
+          : `Only ${formatNumber(room.left)} ${plural(room.left)} left in ${pn}: it has ${formatNumber(room.limit)}, and ${formatNumber(room.limit - room.left)} are already allocated to its other sub-functions.` });
+        renderPhase3();
+        return;
+      }
+      const kidsSum = all.filter(x => x.parent_id === own.id).reduce((t, x) => t + (wfCountOf(x, field) || 0), 0);
+      if (kidsSum > 0 && parsed < kidsSum && (was === null || parsed < was)) {
+        toast('Not saved', { type: 'error', description: `${own.proposed_function_name || 'This function'} cannot have fewer ${noun}s than its sub-functions hold (${formatNumber(kidsSum)}). Lower the ${noun}s of its sub-functions first.` });
+        renderPhase3();
+        return;
+      }
+    }
     state.phase3Values[fnId][field] = parsed;
     // Clearing a figure hands the function back to its percentage share. Typing a Cost % makes the
     // percentage drive the cost again (it used to be silently ignored after a cost had been typed).
@@ -7835,6 +8135,7 @@ const app = {
     const snap = wsNow && wsNow.target_headcount_snapshot != null ? {} : {
       target_headcount_snapshot: divNow ? (divNow.headcount_target || 0) : null,
       target_budget_snapshot: divNow ? (divNow.budget_target || 0) : null };
+    if (wsNow && !wsNow.as_is_snapshot) snap.as_is_snapshot = asIsSnapshotOf(wsNow.division_id);
     updWs(wsId, { status: 'completed', completed_at: wsNow?.completed_at || now, submitted_for_hr_review_at: now, phase: 3, ...snap });
     state.selectedHistoryWorkshopId = wsId;
     this.goToHRReview();
@@ -7948,6 +8249,10 @@ const app = {
       return m.value || '';
     };
     const getDecision = f => decisionOf(f) || 'PENDING';
+    // Decision groups (sheets 6 and 7) count every function, each person once: a function counts
+    // its own part, i.e. what it holds beyond its sub-functions (they count in their own group).
+    // Counting only top-level functions put a parent's whole team under the parent's decision.
+    const ownShare = (f, key) => Math.max(0, roundMoney((f[key] || 0) - fns.filter(c => c.parent_id === f.id).reduce((t, c) => t + (c[key] || 0), 0)));
     const inc = fns.filter(f => getDecision(f) === 'INVEST');
     const kp  = fns.filter(f => getDecision(f) === 'KEEP');
     const opt = fns.filter(f => getDecision(f) === 'OPTIMIZE');
@@ -8012,6 +8317,9 @@ const app = {
 
     // Helper: apply style object to cell
     const applyStyle = (cell, style) => { Object.assign(cell, style); };
+    // Whole amounts keep the plain format; an amount with qapik shows its 2 decimals (28,330.50),
+    // which '#,##0' used to hide (shown as 28,331).
+    const mf = (v, f = '#,##0') => (typeof v === 'number' && !Number.isInteger(roundMoney(v)) ? f.replace(/#,##0/g, '#,##0.00') : f);
 
     // Helper: write a section banner across N columns
     const writeBanner = (sh, row, cols, text, style) => {
@@ -8189,13 +8497,13 @@ const app = {
         sh2.getCell(r, 1).value = i + 1; applyStyle(sh2.getCell(r, 1), cs);
         sh2.getCell(r, 2).value = f.function_name || 'Unnamed'; applyStyle(sh2.getCell(r, 2), csL);
         sh2.getCell(r, 3).value = parentName; applyStyle(sh2.getCell(r, 3), csL);
-        sh2.getCell(r, 4).value = mgr; applyStyle(sh2.getCell(r, 4), cs); sh2.getCell(r, 4).numFmt = '#,##0';
-        sh2.getCell(r, 5).value = prof; applyStyle(sh2.getCell(r, 5), cs); sh2.getCell(r, 5).numFmt = '#,##0';
-        sh2.getCell(r, 6).value = totalHC; applyStyle(sh2.getCell(r, 6), cs); sh2.getCell(r, 6).numFmt = '#,##0';
+        sh2.getCell(r, 4).value = mgr; applyStyle(sh2.getCell(r, 4), cs); sh2.getCell(r, 4).numFmt = mf(sh2.getCell(r, 4).value);
+        sh2.getCell(r, 5).value = prof; applyStyle(sh2.getCell(r, 5), cs); sh2.getCell(r, 5).numFmt = mf(sh2.getCell(r, 5).value);
+        sh2.getCell(r, 6).value = totalHC; applyStyle(sh2.getCell(r, 6), cs); sh2.getCell(r, 6).numFmt = mf(sh2.getCell(r, 6).value);
         sh2.getCell(r, 7).value = totalAsIsHC > 0 ? totalHC / totalAsIsHC : 0; applyStyle(sh2.getCell(r, 7), cs); sh2.getCell(r, 7).numFmt = '0.0%';
-        sh2.getCell(r, 8).value = mgrCost; applyStyle(sh2.getCell(r, 8), cs); sh2.getCell(r, 8).numFmt = '#,##0';
-        sh2.getCell(r, 9).value = profCost; applyStyle(sh2.getCell(r, 9), cs); sh2.getCell(r, 9).numFmt = '#,##0';
-        sh2.getCell(r, 10).value = totalCost; applyStyle(sh2.getCell(r, 10), cs); sh2.getCell(r, 10).numFmt = '#,##0';
+        sh2.getCell(r, 8).value = mgrCost; applyStyle(sh2.getCell(r, 8), cs); sh2.getCell(r, 8).numFmt = mf(sh2.getCell(r, 8).value);
+        sh2.getCell(r, 9).value = profCost; applyStyle(sh2.getCell(r, 9), cs); sh2.getCell(r, 9).numFmt = mf(sh2.getCell(r, 9).value);
+        sh2.getCell(r, 10).value = totalCost; applyStyle(sh2.getCell(r, 10), cs); sh2.getCell(r, 10).numFmt = mf(sh2.getCell(r, 10).value);
         sh2.getCell(r, 11).value = totalAsIsBudget > 0 ? totalCost / totalAsIsBudget : 0; applyStyle(sh2.getCell(r, 11), cs); sh2.getCell(r, 11).numFmt = '0.0%';
         sh2.getRow(r).height = 18; r++;
       });
@@ -8204,13 +8512,13 @@ const app = {
       ai2TotRow.getCell(1).value = ''; applyStyle(ai2TotRow.getCell(1), S.tblHdr);
       ai2TotRow.getCell(2).value = 'TOTAL'; applyStyle(ai2TotRow.getCell(2), S.tblHdr);
       ai2TotRow.getCell(3).value = ''; applyStyle(ai2TotRow.getCell(3), S.tblHdr);
-      ai2TotRow.getCell(4).value = totalAsIsMgrs; applyStyle(ai2TotRow.getCell(4), S.tblHdr); ai2TotRow.getCell(4).numFmt = '#,##0';
-      ai2TotRow.getCell(5).value = totalAsIsProfs; applyStyle(ai2TotRow.getCell(5), S.tblHdr); ai2TotRow.getCell(5).numFmt = '#,##0';
-      ai2TotRow.getCell(6).value = totalAsIsHC; applyStyle(ai2TotRow.getCell(6), S.tblHdr); ai2TotRow.getCell(6).numFmt = '#,##0';
+      ai2TotRow.getCell(4).value = totalAsIsMgrs; applyStyle(ai2TotRow.getCell(4), S.tblHdr); ai2TotRow.getCell(4).numFmt = mf(ai2TotRow.getCell(4).value);
+      ai2TotRow.getCell(5).value = totalAsIsProfs; applyStyle(ai2TotRow.getCell(5), S.tblHdr); ai2TotRow.getCell(5).numFmt = mf(ai2TotRow.getCell(5).value);
+      ai2TotRow.getCell(6).value = totalAsIsHC; applyStyle(ai2TotRow.getCell(6), S.tblHdr); ai2TotRow.getCell(6).numFmt = mf(ai2TotRow.getCell(6).value);
       ai2TotRow.getCell(7).value = ''; applyStyle(ai2TotRow.getCell(7), S.tblHdr);
-      ai2TotRow.getCell(8).value = rootAsIsFns.reduce((s, f) => s + (f.managers_cost || 0), 0); applyStyle(ai2TotRow.getCell(8), S.tblHdr); ai2TotRow.getCell(8).numFmt = '#,##0';
-      ai2TotRow.getCell(9).value = rootAsIsFns.reduce((s, f) => s + (f.professionals_cost || 0), 0); applyStyle(ai2TotRow.getCell(9), S.tblHdr); ai2TotRow.getCell(9).numFmt = '#,##0';
-      ai2TotRow.getCell(10).value = totalAsIsBudget; applyStyle(ai2TotRow.getCell(10), S.tblHdr); ai2TotRow.getCell(10).numFmt = '#,##0';
+      ai2TotRow.getCell(8).value = rootAsIsFns.reduce((s, f) => s + (f.managers_cost || 0), 0); applyStyle(ai2TotRow.getCell(8), S.tblHdr); ai2TotRow.getCell(8).numFmt = mf(ai2TotRow.getCell(8).value);
+      ai2TotRow.getCell(9).value = rootAsIsFns.reduce((s, f) => s + (f.professionals_cost || 0), 0); applyStyle(ai2TotRow.getCell(9), S.tblHdr); ai2TotRow.getCell(9).numFmt = mf(ai2TotRow.getCell(9).value);
+      ai2TotRow.getCell(10).value = totalAsIsBudget; applyStyle(ai2TotRow.getCell(10), S.tblHdr); ai2TotRow.getCell(10).numFmt = mf(ai2TotRow.getCell(10).value);
       ai2TotRow.getCell(11).value = ''; applyStyle(ai2TotRow.getCell(11), S.tblHdr);
       ai2TotRow.height = 22;
 
@@ -8339,11 +8647,11 @@ const app = {
         sh5.getCell(r, 3).value = allocBase; applyStyle(sh5.getCell(r, 3), csL);
         sh5.getCell(r, 4).value = dec; applyStyle(sh5.getCell(r, 4), decStyle(dec));
         sh5.getCell(r, 5).value = (f.hc_allocation_percent || 0) / 100; applyStyle(sh5.getCell(r, 5), cs); sh5.getCell(r, 5).numFmt = '0.0%';
-        sh5.getCell(r, 6).value = f.proposed_hc || 0; applyStyle(sh5.getCell(r, 6), S.greenBold); sh5.getCell(r, 6).numFmt = '#,##0';
+        sh5.getCell(r, 6).value = f.proposed_hc || 0; applyStyle(sh5.getCell(r, 6), S.greenBold); sh5.getCell(r, 6).numFmt = mf(sh5.getCell(r, 6).value);
         sh5.getCell(r, 7).value = (f.cost_allocation_percent || 0) / 100; applyStyle(sh5.getCell(r, 7), cs); sh5.getCell(r, 7).numFmt = '0.0%';
-        sh5.getCell(r, 8).value = f.proposed_budget || 0; applyStyle(sh5.getCell(r, 8), S.greenBold); sh5.getCell(r, 8).numFmt = '#,##0';
-        sh5.getCell(r, 9).value = mgr; applyStyle(sh5.getCell(r, 9), cs); sh5.getCell(r, 9).numFmt = '#,##0';
-        sh5.getCell(r, 10).value = prof; applyStyle(sh5.getCell(r, 10), cs); sh5.getCell(r, 10).numFmt = '#,##0';
+        sh5.getCell(r, 8).value = f.proposed_budget || 0; applyStyle(sh5.getCell(r, 8), S.greenBold); sh5.getCell(r, 8).numFmt = mf(sh5.getCell(r, 8).value);
+        sh5.getCell(r, 9).value = mgr; applyStyle(sh5.getCell(r, 9), cs); sh5.getCell(r, 9).numFmt = mf(sh5.getCell(r, 9).value);
+        sh5.getCell(r, 10).value = prof; applyStyle(sh5.getCell(r, 10), cs); sh5.getCell(r, 10).numFmt = mf(sh5.getCell(r, 10).value);
         sh5.getCell(r, 11).value = spanTxt; applyStyle(sh5.getCell(r, 11), cs);
         sh5.getCell(r, 12).value = spanAlertTxt; applyStyle(sh5.getCell(r, 12), (spanAlertTxt === 'Healthy Span' || spanAlertTxt === 'OK') ? S.greenBold : (spanAlertTxt === 'N/A' ? cs : S.redBold));
         sh5.getCell(r, 13).value = allocAlert || 'OK'; applyStyle(sh5.getCell(r, 13), allocAlert ? S.redBold : S.greenBold);
@@ -8355,10 +8663,10 @@ const app = {
         applyStyle(p3TotRow.getCell(i + 1), S.tblHdr);
         p3TotRow.getCell(i + 1).value = v;
       });
-      p3TotRow.getCell(6).value = totalToBeHC; p3TotRow.getCell(6).numFmt = '#,##0';
-      p3TotRow.getCell(8).value = totalToBeBudget; p3TotRow.getCell(8).numFmt = '#,##0';
-      p3TotRow.getCell(9).value = totalToBeMgrs; p3TotRow.getCell(9).numFmt = '#,##0';
-      p3TotRow.getCell(10).value = totalToBeProfs; p3TotRow.getCell(10).numFmt = '#,##0';
+      p3TotRow.getCell(6).value = totalToBeHC; p3TotRow.getCell(6).numFmt = mf(p3TotRow.getCell(6).value);
+      p3TotRow.getCell(8).value = totalToBeBudget; p3TotRow.getCell(8).numFmt = mf(p3TotRow.getCell(8).value);
+      p3TotRow.getCell(9).value = totalToBeMgrs; p3TotRow.getCell(9).numFmt = mf(p3TotRow.getCell(9).value);
+      p3TotRow.getCell(10).value = totalToBeProfs; p3TotRow.getCell(10).numFmt = mf(p3TotRow.getCell(10).value);
       p3TotRow.height = 22;
 
       // ════════════════════════════════════════════════════════════════
@@ -8400,9 +8708,9 @@ const app = {
         } else {
           const [lbl, asis, tgt, prop, status] = row;
           sh6.getCell(r, 1).value = lbl; applyStyle(sh6.getCell(r, 1), S.rowLabel);
-          sh6.getCell(r, 2).value = asis !== '' ? asis : '—'; applyStyle(sh6.getCell(r, 2), S.tblCell); if (typeof asis === 'number') sh6.getCell(r, 2).numFmt = '#,##0';
-          sh6.getCell(r, 3).value = tgt !== '' ? tgt : '—'; applyStyle(sh6.getCell(r, 3), S.goldBold); if (typeof tgt === 'number') sh6.getCell(r, 3).numFmt = '#,##0';
-          sh6.getCell(r, 4).value = prop !== '' ? prop : '—'; applyStyle(sh6.getCell(r, 4), S.greenBold); if (typeof prop === 'number') sh6.getCell(r, 4).numFmt = '#,##0';
+          sh6.getCell(r, 2).value = asis !== '' ? asis : '—'; applyStyle(sh6.getCell(r, 2), S.tblCell); if (typeof asis === 'number') sh6.getCell(r, 2).numFmt = mf(sh6.getCell(r, 2).value);
+          sh6.getCell(r, 3).value = tgt !== '' ? tgt : '—'; applyStyle(sh6.getCell(r, 3), S.goldBold); if (typeof tgt === 'number') sh6.getCell(r, 3).numFmt = mf(sh6.getCell(r, 3).value);
+          sh6.getCell(r, 4).value = prop !== '' ? prop : '—'; applyStyle(sh6.getCell(r, 4), S.greenBold); if (typeof prop === 'number') sh6.getCell(r, 4).numFmt = mf(sh6.getCell(r, 4).value);
           const isOverTarget = typeof status === 'string' && status.startsWith('Over');
           const isOnTarget = status === 'On Target' || status === 'OK';
           sh6.getCell(r, 5).value = status || '—';
@@ -8424,14 +8732,13 @@ const app = {
       ];
       decRows.forEach(([label, arr, style]) => {
         const pct = fns.length > 0 ? arr.length / fns.length : 0;
-        const rootArr = arr.filter(f => !(f.parent_id && fnIds.has(f.parent_id)));
-        const dHC = rootArr.reduce((s, f) => s + (f.proposed_hc || 0), 0);
-        const dBudg = rootArr.reduce((s, f) => s + (f.proposed_budget || 0), 0);
+        const dHC = arr.reduce((s, f) => s + ownShare(f, 'proposed_hc'), 0);
+        const dBudg = roundMoney(arr.reduce((s, f) => s + ownShare(f, 'proposed_budget'), 0));
         sh6.getCell(r, 1).value = label; applyStyle(sh6.getCell(r, 1), style);
         sh6.getCell(r, 2).value = arr.length; applyStyle(sh6.getCell(r, 2), S.tblCell);
         sh6.getCell(r, 3).value = pct; applyStyle(sh6.getCell(r, 3), S.tblCell); sh6.getCell(r, 3).numFmt = '0.0%';
-        sh6.getCell(r, 4).value = dHC; applyStyle(sh6.getCell(r, 4), S.tblCell); sh6.getCell(r, 4).numFmt = '#,##0';
-        sh6.getCell(r, 5).value = dBudg; applyStyle(sh6.getCell(r, 5), S.tblCell); sh6.getCell(r, 5).numFmt = '#,##0';
+        sh6.getCell(r, 4).value = dHC; applyStyle(sh6.getCell(r, 4), S.tblCell); sh6.getCell(r, 4).numFmt = mf(sh6.getCell(r, 4).value);
+        sh6.getCell(r, 5).value = dBudg; applyStyle(sh6.getCell(r, 5), S.tblCell); sh6.getCell(r, 5).numFmt = mf(sh6.getCell(r, 5).value);
         sh6.getRow(r).height = 20; r++;
       });
       // Totals
@@ -8439,8 +8746,8 @@ const app = {
       decTotRow.getCell(1).value = 'TOTAL'; applyStyle(decTotRow.getCell(1), S.tblHdr);
       decTotRow.getCell(2).value = fns.length; applyStyle(decTotRow.getCell(2), S.tblHdr);
       decTotRow.getCell(3).value = ''; applyStyle(decTotRow.getCell(3), S.tblHdr);
-      decTotRow.getCell(4).value = totalToBeHC; applyStyle(decTotRow.getCell(4), S.tblHdr); decTotRow.getCell(4).numFmt = '#,##0';
-      decTotRow.getCell(5).value = totalToBeBudget; applyStyle(decTotRow.getCell(5), S.tblHdr); decTotRow.getCell(5).numFmt = '#,##0';
+      decTotRow.getCell(4).value = totalToBeHC; applyStyle(decTotRow.getCell(4), S.tblHdr); decTotRow.getCell(4).numFmt = mf(decTotRow.getCell(4).value);
+      decTotRow.getCell(5).value = totalToBeBudget; applyStyle(decTotRow.getCell(5), S.tblHdr); decTotRow.getCell(5).numFmt = mf(decTotRow.getCell(5).value);
       decTotRow.height = 22;
 
       // ════════════════════════════════════════════════════════════════
@@ -8458,16 +8765,18 @@ const app = {
         ['AS-IS Total HC',   totalAsIsHC,           '#,##0', S.tblCell],
         ['Target HC',        div.headcount_target || 0, '#,##0', S.goldBold],
         ['HC Difference (AS-IS vs Target)', asIsHcDiff, '+#,##0;-#,##0;0', asIsHcDiff > 0 ? S.redBold : asIsHcDiff < 0 ? S.greenBold : S.tblCell],
-        ['HC Change %', div.headcount_target > 0 ? (asIsHcDiff / div.headcount_target) : 0, '0.0%', S.tblCell],
+        // the change the target asks for, measured from today's AS-IS (57 -> 48 = -15.8%)
+        ['HC Change % (Target vs AS-IS)', totalAsIsHC > 0 ? ((div.headcount_target || 0) - totalAsIsHC) / totalAsIsHC : 0, '0.0%', S.tblCell],
       ] : [
         ['AS-IS Total HC',   totalAsIsHC,           '#,##0', S.tblCell],
         ['Target HC',        div.headcount_target || 0, '#,##0', S.goldBold],
         ['Proposed HC',      totalToBeHC,           '#,##0', S.greenBold],
         ['HC Difference (Proposed vs Target)', hcDiff, '+#,##0;-#,##0;0', hcDiff > 0 ? S.redBold : hcDiff < 0 ? S.greenBold : S.tblCell],
-        ['HC Change %', div.headcount_target > 0 ? (hcDiff / div.headcount_target) : 0, '0.0%', S.tblCell],
+        // the change the proposal makes, measured from today's AS-IS (57 -> 48 = -15.8%)
+        ['HC Change % (Proposed vs AS-IS)', totalAsIsHC > 0 ? (totalToBeHC - totalAsIsHC) / totalAsIsHC : 0, '0.0%', S.tblCell],
       ]).forEach(([lbl, val, fmt, style]) => {
         sh7.getCell(r, 1).value = lbl; applyStyle(sh7.getCell(r, 1), S.rowLabel);
-        sh7.getCell(r, 2).value = val; applyStyle(sh7.getCell(r, 2), style); sh7.getCell(r, 2).numFmt = fmt;
+        sh7.getCell(r, 2).value = val; applyStyle(sh7.getCell(r, 2), style); sh7.getCell(r, 2).numFmt = mf(val, fmt);
         sh7.getRow(r).height = 18; r++;
       });
       r++;
@@ -8478,16 +8787,16 @@ const app = {
         ['AS-IS Total Budget (AZN)',   totalAsIsBudget,         '#,##0', S.tblCell],
         ['Target Budget (AZN)',        div.budget_target || 0,  '#,##0', S.goldBold],
         ['Budget Difference (AS-IS vs Target)', asIsBudgDiff, '+#,##0;-#,##0;0', asIsBudgDiff > 0 ? S.redBold : asIsBudgDiff < 0 ? S.greenBold : S.tblCell],
-        ['Budget Change %', div.budget_target > 0 ? (asIsBudgDiff / div.budget_target) : 0, '0.0%', S.tblCell],
+        ['Budget Change % (Target vs AS-IS)', totalAsIsBudget > 0 ? ((div.budget_target || 0) - totalAsIsBudget) / totalAsIsBudget : 0, '0.0%', S.tblCell],
       ] : [
         ['AS-IS Total Budget (AZN)',   totalAsIsBudget,         '#,##0', S.tblCell],
         ['Target Budget (AZN)',        div.budget_target || 0,  '#,##0', S.goldBold],
         ['Proposed Budget (AZN)',      totalToBeBudget,         '#,##0', S.greenBold],
         ['Budget Difference (Proposed vs Target)', budgDiff, '+#,##0;-#,##0;0', budgDiff > 0 ? S.redBold : budgDiff < 0 ? S.greenBold : S.tblCell],
-        ['Budget Change %', div.budget_target > 0 ? (budgDiff / div.budget_target) : 0, '0.0%', S.tblCell],
+        ['Budget Change % (Proposed vs AS-IS)', totalAsIsBudget > 0 ? (totalToBeBudget - totalAsIsBudget) / totalAsIsBudget : 0, '0.0%', S.tblCell],
       ]).forEach(([lbl, val, fmt, style]) => {
         sh7.getCell(r, 1).value = lbl; applyStyle(sh7.getCell(r, 1), S.rowLabel);
-        sh7.getCell(r, 2).value = val; applyStyle(sh7.getCell(r, 2), style); sh7.getCell(r, 2).numFmt = fmt;
+        sh7.getCell(r, 2).value = val; applyStyle(sh7.getCell(r, 2), style); sh7.getCell(r, 2).numFmt = mf(val, fmt);
         sh7.getRow(r).height = 18; r++;
       });
       r++;
@@ -8523,14 +8832,13 @@ const app = {
         const alt = idx % 2 === 1;
         const cs = alt ? S.tblAlt : S.tblCell;
         const pct = fns.length > 0 ? arr.length / fns.length : 0;
-        const rootArr = arr.filter(f => !(f.parent_id && fnIds.has(f.parent_id)));
-        const dHC = rootArr.reduce((s, f) => s + (f.proposed_hc || 0), 0);
-        const dBudg = rootArr.reduce((s, f) => s + (f.proposed_budget || 0), 0);
+        const dHC = arr.reduce((s, f) => s + ownShare(f, 'proposed_hc'), 0);
+        const dBudg = roundMoney(arr.reduce((s, f) => s + ownShare(f, 'proposed_budget'), 0));
         sh7.getCell(r, 1).value = label; applyStyle(sh7.getCell(r, 1), style);
         sh7.getCell(r, 2).value = arr.length; applyStyle(sh7.getCell(r, 2), cs);
         sh7.getCell(r, 3).value = pct; applyStyle(sh7.getCell(r, 3), cs); sh7.getCell(r, 3).numFmt = '0.0%';
-        sh7.getCell(r, 4).value = dHC; applyStyle(sh7.getCell(r, 4), cs); sh7.getCell(r, 4).numFmt = '#,##0';
-        sh7.getCell(r, 5).value = dBudg; applyStyle(sh7.getCell(r, 5), cs); sh7.getCell(r, 5).numFmt = '#,##0';
+        sh7.getCell(r, 4).value = dHC; applyStyle(sh7.getCell(r, 4), cs); sh7.getCell(r, 4).numFmt = mf(sh7.getCell(r, 4).value);
+        sh7.getCell(r, 5).value = dBudg; applyStyle(sh7.getCell(r, 5), cs); sh7.getCell(r, 5).numFmt = mf(sh7.getCell(r, 5).value);
         sh7.getCell(r, 6).value = ''; applyStyle(sh7.getCell(r, 6), cs);
         sh7.getRow(r).height = 20; r++;
       });
@@ -8603,7 +8911,7 @@ const app = {
           const cell = sh8.getCell(r, ci + 1);
           cell.value = val;
           applyStyle(cell, style);
-          if (numFmts[ci]) cell.numFmt = numFmts[ci];
+          if (numFmts[ci]) cell.numFmt = numFmts[ci] === '#,##0' ? mf(cell.value) : numFmts[ci];
         });
         sh8.getRow(r).height = 18; r++;
       });
@@ -8630,6 +8938,7 @@ const app = {
       ["#", "Function Title", "Parent Function", "Managers", "Professionals", "Managers Cost (AZN)", " Professionals Cost (AZN)"].forEach((h, i) => rgCell(6, i + 1, h, { font: rgFont({ bold: true, color: { argb: 'FFFFFFFF' } }), fill: mkFill('FF2E642C'), alignment: mkAlign('center', 'middle', true), border: rgBorder }));
       sh9.getRow(6).height = 30;
       const rgRootName = div.structure_name || 'Division';
+      const rgRootClash = asIsFns.some(f => normFnTitle(f.function_name) === normFnTitle(rgRootName));
       rgCell(7, 1, 'ROOT', { font: rgFont({ bold: true, color: { argb: 'FFFFFFFF' } }), fill: mkFill('FF0F3C76'), alignment: mkAlign('center', 'middle'), border: rgBorder });
       rgCell(7, 2, rgRootName, { font: rgFont({ color: { argb: 'FF6B7280' } }), fill: mkFill('FFFFF7D6'), alignment: mkAlign('left', 'middle'), border: rgBorder });
       rgCell(7, 3, '\u2014', { font: rgFont({ color: { argb: 'FF6B7280' } }), fill: mkFill('FFE5E7EB'), alignment: mkAlign('center', 'middle'), border: rgBorder });
@@ -8650,7 +8959,9 @@ const app = {
         const data = { font: rgFont({ bold: isParent }), fill: mkFill('FFFFF7D6'), border: rgBorder };
         rgCell(rgRow, 1, null, { font: rgFont({ bold: isParent, color: { argb: 'FF6B7280' } }), fill: mkFill('FFFFFFFF'), alignment: mkAlign('center', 'middle'), border: rgBorder });
         rgCell(rgRow, 2, f.function_name || '', { ...data, alignment: mkAlign('left', 'middle') });
-        rgCell(rgRow, 3, parentFn ? (parentFn.function_name || '') : rgRootName, { ...data, alignment: mkAlign('left', 'middle') });
+        // a function titled like the structure would make the ROOT name ambiguous on upload, so the
+        // top-level rows then leave Parent Function blank (which the template reads as "top level")
+        rgCell(rgRow, 3, parentFn ? (parentFn.function_name || '') : (rgRootClash ? '' : rgRootName), { ...data, alignment: mkAlign('left', 'middle') });
         rgCell(rgRow, 4, f.manager_count || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0';
         rgCell(rgRow, 5, f.current_employee_count || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0';
         rgCell(rgRow, 6, f.managers_cost || 0, { ...data, alignment: mkAlign('center', 'middle') }).numFmt = '#,##0.00';
@@ -8899,11 +9210,26 @@ const app = {
     await this.init();
   },
 
-  async signOut() {
+  async signOut(force) {
     const sb = window.zbodSupabase;
     // Changes still waiting to reach the cloud get one last chance (bounded, so sign-out can't hang).
     if (sb && sb.supabaseAvailable && sb.sbFlushOutbox && sb.sbOutboxCount && sb.sbOutboxCount() > 0) {
       try { await Promise.race([sb.sbFlushOutbox(), new Promise(r => setTimeout(r, 5000))]); } catch (_) {}
+    }
+    // Signing out removes this computer's copy, so changes that still have not reached the cloud
+    // (no connection) would be lost without a word. Ask first.
+    const unsent = sb && sb.supabaseAvailable && sb.sbOutboxCount ? sb.sbOutboxCount() : 0;
+    if (unsent > 0 && force !== true) {
+      showConfirmDialog({
+        title: 'Changes not saved to the cloud yet',
+        message: `${unsent} change${unsent !== 1 ? 's have' : ' has'} not reached the cloud yet (no connection). `
+          + `If you sign out now, ${unsent !== 1 ? 'they' : 'it'} will be lost. Stay signed in until the connection is back, then sign out.`,
+        confirmLabel: 'Sign out anyway',
+        cancelLabel: 'Stay signed in',
+        danger: true,
+        onConfirmAttr: 'app.signOut(true)',
+      });
+      return;
     }
     if (sb && sb.supabaseAvailable) await sb.sbAuthSignOut();
     setCurrentProfile(null);
@@ -9381,6 +9707,19 @@ function reportSchemaGap(table, column) {
   toast('Bazada sütun çatışmır', { type: 'error', description: `${table}.${column} buluda yazılmır — bu dəyər başqa kompüterdə görünməyəcək. Supabase SQL Editor-da supabase_*.sql faylları icra edilməlidir.` });
 }
 
+// Another person changed the same row at the same time; supabase.js kept both changes (see
+// sbPatchRow). This computer's copy takes the cloud's merged row, and the user is told once a minute.
+let lastRebaseNoteAt = 0;
+function reportSyncRebased(table, row) {
+  const key = { divisions: LS.divisions, workshops: LS.workshops, workshop_functions: LS.functions, as_is_functions: LS.asIs }[table];
+  if (!key || !row || row.id == null) return;
+  lsSet(key, lsGet(key, []).map(x => (x.id === row.id ? { ...x, ...row } : x)));
+  const now = Date.now();
+  if (now - lastRebaseNoteAt < 60000) return;
+  lastRebaseNoteAt = now;
+  toast('Someone else changed this data at the same time', { description: 'Both changes were kept. Refresh the page (F5) to see the latest figures.' });
+}
+
 // When a child row is refused because its parent never reached the cloud, supabase.js asks for the
 // ancestors (read from this browser's own copy) and sends them first. Only ancestors of a row the
 // user is actively writing — never the whole local cache.
@@ -9403,6 +9742,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.zbodSupabase.sbSetRecoveredHandler(reportSyncRecovered);
     window.zbodSupabase.sbSetSchemaGapHandler(reportSchemaGap);
     window.zbodSupabase.sbSetParentResolver(resolveSyncParents);
+    if (window.zbodSupabase.sbSetRebasedHandler) window.zbodSupabase.sbSetRebasedHandler(reportSyncRebased);
   }
   app.init();
 });
